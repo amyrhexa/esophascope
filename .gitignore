@@ -1,0 +1,66 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Packaging / Distribution
+dist/
+build/
+*.egg-info/
+*.egg
+eggs/
+.eggs/
+
+# Testing & Linting
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE & OS Artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Deep Learning / Model Weights & Runs
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+runs/
+wandb/
+
+# Whole-Slide Images & Heavy Pathology Data
+*.svs
+*.ndpi
+*.mrxs
+*.tif
+*.tiff
+*.vms
+*.vmu
+*.scn
+*.bif
+*.dcm
+
+# Annotation / Cache Outputs
+*.geojson
+*.json.bak
+repomix*
