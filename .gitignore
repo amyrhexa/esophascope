@@ -42,7 +42,6 @@ Thumbs.db
 # Deep Learning / Model Weights & Runs
 *.pt
 *.pth
-*.onnx
 *.engine
 *.tflite
 runs/

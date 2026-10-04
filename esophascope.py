@@ -8,6 +8,7 @@ bidirectional QuPath GeoJSON synchronization.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import gc
 import json
@@ -19,18 +20,19 @@ from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 import openslide
-import torch
 from PIL import Image
 from PySide6.QtCore import (
+    QByteArray,
     QObject,
     QPointF,
     QRectF,
     QRunnable,
+    QSize,
     Qt,
     QThread,
     QThreadPool,
@@ -43,6 +45,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDragMoveEvent,
     QDropEvent,
+    QIcon,
     QImage,
     QKeySequence,
     QPainter,
@@ -53,6 +56,7 @@ from PySide6.QtGui import (
     QShortcut,
     QWheelEvent,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -71,17 +75,11 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
-    QStyle,
     QStyleOptionGraphicsItem,
     QVBoxLayout,
     QWidget,
 )
 from scipy.spatial import KDTree
-
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
 
 logger = logging.getLogger("esophascope")
 logging.basicConfig(
@@ -92,7 +90,9 @@ logging.basicConfig(
 # ==============================================================================
 # CLINICAL BENCHMARKS & PIPELINE CONSTANTS
 # ==============================================================================
-DEFAULT_MODEL_WEIGHTS = "./best.pt"
+APP_ID = "esophascope"
+APP_ICON_FILE = "app.ico"
+DEFAULT_MODEL_WEIGHTS = "best.onnx"
 TARGET_MODEL_MPP = 0.173
 PATCH_PIXEL_DIMENSION = 640
 PATCH_MICRON_SPAN = PATCH_PIXEL_DIMENSION * TARGET_MODEL_MPP
@@ -107,6 +107,10 @@ CENTROID_MATCH_TOLERANCE_UM = 7.0
 BASE_TENSOR_EXTRACTION_CONFIDENCE = 0.10
 DEFAULT_OPERATIONAL_CONFIDENCE = 0.25
 SLIDE_NMS_IOU_THRESHOLD = 0.45
+# Per-patch NMS settings matching the Ultralytics predict() defaults that
+# produced the original results (iou=0.7, max_det=300).
+PATCH_NMS_IOU_THRESHOLD = 0.7
+PATCH_MAX_DETECTIONS = 300
 PATCH_STRIDE_OVERLAP_RATIO = 0.20
 TISSUE_SATURATION_FLOOR = 25
 TISSUE_COVERAGE_MINIMUM_FRACTION = 0.05
@@ -141,6 +145,77 @@ COLOR_TISSUE_OVERLAY = "#2563EB"
 COLOR_GROUND_TRUTH = "#16A34A"
 COLOR_PREDICTION_BOX = "#DC2626"
 COLOR_HOTSPOT_BOUNDARY = "#D97706"
+
+
+def resource_path(relative: str) -> Path:
+    """Resolves a bundled asset for both source runs and PyInstaller builds."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
+
+
+# 24x24 stroke glyphs (Lucide-style). Rendered from SVG at several pixel sizes so
+# they stay sharp at any DPI scale and look identical on Windows and Linux,
+# unlike QStyle.standardIcon() which depends on the platform theme.
+_ICON_SHAPES = {
+    "folder": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+    "file-text": (
+        '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>'
+        '<path d="M14 3v5h5M9 13h6M9 17h6"/>'
+    ),
+    "play": '<path d="M7 4.5v15l12-7.5z" fill="currentColor"/>',
+    "stop": '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
+    "download": '<path d="M12 3v12M7 10l5 5 5-5M4 21h16"/>',
+    "chevron-left": '<path d="M15 5l-7 7 7 7"/>',
+    "chevron-right": '<path d="M9 5l7 7-7 7"/>',
+    "crosshair": (
+        '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/>'
+        '<path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>'
+    ),
+}
+_ICON_PIXEL_SIZES = (16, 20, 24, 32, 40, 48, 64)
+
+
+def build_svg_icon(
+    name: str,
+    color: str = COLOR_TEXT_EMPHASIZED,
+    disabled_color: str = COLOR_TEXT_DISABLED,
+    active_color: str | None = None,
+) -> QIcon:
+    """Renders a named glyph into a multi-resolution QIcon with state colors."""
+    icon = QIcon()
+    tints = {
+        QIcon.Mode.Normal: color,
+        QIcon.Mode.Disabled: disabled_color,
+        QIcon.Mode.Active: active_color or color,
+    }
+    for mode, tint in tints.items():
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+            f'stroke="{tint}" stroke-width="2" stroke-linecap="round" '
+            f'stroke-linejoin="round">{_ICON_SHAPES[name].replace("currentColor", tint)}</svg>'
+        )
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        for size in _ICON_PIXEL_SIZES:
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHints(
+                QPainter.RenderHint.Antialiasing
+                | QPainter.RenderHint.SmoothPixmapTransform
+            )
+            renderer.render(painter)
+            painter.end()
+            icon.addPixmap(pixmap, mode)
+    return icon
+
+
+def load_app_icon() -> QIcon:
+    """Loads the multi-size application icon (empty icon if the file is missing)."""
+    icon_file = resource_path(APP_ICON_FILE)
+    if not icon_file.is_file():
+        logger.warning("Application icon not found: %s", icon_file)
+        return QIcon()
+    return QIcon(str(icon_file))
 
 
 def build_workbench_stylesheet() -> str:
@@ -535,53 +610,50 @@ class EvaluationSummary:
 # ==============================================================================
 # SECTION 2: PATHOLOGY PROCESSING & SPATIAL ALGORITHMS
 # ==============================================================================
-def apply_slide_wide_nms(
+def non_max_suppression(
     boxes: np.ndarray, scores: np.ndarray, iou_thresh: float
 ) -> list[int]:
-    """Slide-wide non-maximum suppression using TorchVision or vectorized NumPy."""
-    if len(boxes) == 0:
+    """Greedy NMS returning kept indices, highest score first (pure NumPy).
+
+    Boxes are visited in descending score order and only compared against
+    boxes whose x-range can overlap (found via a sorted x1 index), which keeps
+    slide-wide merges near-linear instead of quadratic.
+    """
+    n = len(boxes)
+    if n == 0:
         return []
 
-    try:
-        import torchvision.ops
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    by_x1 = np.argsort(x1)
+    sorted_x1 = x1[by_x1]
+    max_width = float(np.max(x2 - x1))
+    suppressed = np.zeros(n, dtype=bool)
+    kept: list[int] = []
 
-        boxes_t = torch.as_tensor(boxes, dtype=torch.float32)
-        scores_t = torch.as_tensor(scores, dtype=torch.float32)
-        if torch.cuda.is_available():
-            boxes_t = boxes_t.cuda()
-            scores_t = scores_t.cuda()
-        return torchvision.ops.nms(boxes_t, scores_t, iou_thresh).cpu().tolist()
-    except (ImportError, RuntimeError, TypeError):
-        x1 = boxes[:, 0]
-        y1 = boxes[:, 1]
-        x2 = boxes[:, 2]
-        y2 = boxes[:, 3]
-        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
-        order = scores.argsort()[::-1]
-        survivors: list[int] = []
+    for i in np.argsort(-scores, kind="stable"):
+        if suppressed[i]:
+            continue
+        kept.append(int(i))
 
-        while order.size > 0:
-            idx = order[0]
-            survivors.append(int(idx))
-            if order.size == 1:
-                break
+        lo = np.searchsorted(sorted_x1, x1[i] - max_width, side="left")
+        hi = np.searchsorted(sorted_x1, x2[i], side="right")
+        cand = by_x1[lo:hi]
+        cand = cand[(cand != i) & ~suppressed[cand]]
+        if cand.size == 0:
+            continue
 
-            rest = order[1:]
-            xx1 = np.maximum(x1[idx], x1[rest])
-            yy1 = np.maximum(y1[idx], y1[rest])
-            xx2 = np.minimum(x2[idx], x2[rest])
-            yy2 = np.minimum(y2[idx], y2[rest])
+        inter_w = np.maximum(
+            0.0, np.minimum(x2[i], x2[cand]) - np.maximum(x1[i], x1[cand])
+        )
+        inter_h = np.maximum(
+            0.0, np.minimum(y2[i], y2[cand]) - np.maximum(y1[i], y1[cand])
+        )
+        inter = inter_w * inter_h
+        iou = inter / (areas[i] + areas[cand] - inter + 1e-7)
+        suppressed[cand[iou > iou_thresh]] = True
 
-            intersection_w = np.maximum(0.0, xx2 - xx1)
-            intersection_h = np.maximum(0.0, yy2 - yy1)
-            intersection_area = intersection_w * intersection_h
-
-            union_area = areas[idx] + areas[rest] - intersection_area + 1e-7
-            overlap_ratio = intersection_area / union_area
-            viable = np.where(overlap_ratio <= iou_thresh)[0]
-            order = rest[viable]
-
-        return survivors
+    return kept
 
 
 def generate_tissue_mask_hsv(
@@ -735,7 +807,7 @@ def compute_cellular_performance_metrics(
 
 def parse_qupath_geojson(geojson_path: str | Path) -> list[GroundTruthCell]:
     """Loads and standardizes QuPath GeoJSON annotations."""
-    with open(geojson_path, "r", encoding="utf-8") as f:
+    with open(geojson_path, encoding="utf-8") as f:
         payload = json.load(f)
 
     raw_features = payload.get("features", []) if isinstance(payload, dict) else payload
@@ -891,10 +963,8 @@ class ThreadLocalSlideProvider:
     def shutdown(self) -> None:
         with self._lock:
             for handle in self._open_handles:
-                try:
+                with contextlib.suppress(openslide.OpenSlideError, OSError):
                     handle.close()
-                except (openslide.OpenSlideError, OSError):
-                    pass
             self._open_handles.clear()
 
 
@@ -1258,8 +1328,141 @@ class DiagnosticHotspotOverlay(QGraphicsItem):
 
 
 # ==============================================================================
-# SECTION 5: ASYNC INFERENCE WORKER
+# SECTION 5: ONNX DETECTOR & ASYNC INFERENCE WORKER
 # ==============================================================================
+_PROVIDER_PREFERENCE = (
+    "CUDAExecutionProvider",
+    "ROCMExecutionProvider",
+    "DmlExecutionProvider",
+    "CPUExecutionProvider",
+)
+_PROVIDER_LABELS = {
+    "CUDAExecutionProvider": "GPU · CUDA",
+    "ROCMExecutionProvider": "GPU · ROCm",
+    "DmlExecutionProvider": "GPU · DirectML",
+    "CPUExecutionProvider": "CPU",
+}
+_ONNX_INPUT_DTYPES = {"tensor(float)": np.float32, "tensor(float16)": np.float16}
+
+
+def select_execution_providers() -> list[str]:
+    """Orders the installed ONNX Runtime providers: GPU backends first, CPU last."""
+    available = set(ort.get_available_providers())
+    chosen = [p for p in _PROVIDER_PREFERENCE if p in available]
+    return chosen or ["CPUExecutionProvider"]
+
+
+def describe_provider(provider: str) -> str:
+    return _PROVIDER_LABELS.get(provider, provider)
+
+
+class OnnxEosinophilDetector:
+    """ONNX Runtime wrapper reproducing Ultralytics detect pre/post-processing.
+
+    Expects a single-output detection export (`yolo export format=onnx`):
+      * raw head  -> (B, 4 + num_classes, N), boxes as cx, cy, w, h in input pixels
+      * end-to-end / NMS-embedded head -> (B, N, 6) as x1, y1, x2, y2, score, class
+    Tiles are already model-sized (640 px), so no letterbox padding is needed.
+    """
+
+    def __init__(self, model_path: str | Path, conf_threshold: float) -> None:
+        path = Path(model_path)
+        if path.suffix.lower() != ".onnx":
+            raise ValueError(
+                f"Expected an .onnx model, got '{path.name}'. "
+                "Export with: yolo export model=best.pt format=onnx"
+            )
+        if not path.is_file():
+            raise FileNotFoundError(f"ONNX model not found: {path}")
+
+        providers = select_execution_providers()
+        options = ort.SessionOptions()
+        options.log_severity_level = 3
+        if "DmlExecutionProvider" in providers:
+            options.enable_mem_pattern = False  # required by the DirectML provider
+        self._session = ort.InferenceSession(
+            str(path), sess_options=options, providers=providers
+        )
+
+        outputs = self._session.get_outputs()
+        if len(outputs) != 1:
+            raise ValueError(
+                f"Expected a single-output detection model, found {len(outputs)} "
+                "outputs (segmentation models are not supported)."
+            )
+
+        model_input = self._session.get_inputs()[0]
+        if model_input.type not in _ONNX_INPUT_DTYPES:
+            raise ValueError(f"Unsupported ONNX input type: {model_input.type}")
+        self._input_name = model_input.name
+        self._input_dtype = _ONNX_INPUT_DTYPES[model_input.type]
+        batch_dim, _, height_dim, width_dim = model_input.shape
+        # Exports are static-batch unless made with dynamic=True.
+        self._static_batch: int | None = (
+            batch_dim if isinstance(batch_dim, int) else None
+        )
+        for dim in (height_dim, width_dim):
+            if isinstance(dim, int) and dim != PATCH_PIXEL_DIMENSION:
+                raise ValueError(
+                    f"Model input is {height_dim}x{width_dim} but tiles are "
+                    f"{PATCH_PIXEL_DIMENSION}x{PATCH_PIXEL_DIMENSION}; re-export with "
+                    f"imgsz={PATCH_PIXEL_DIMENSION}."
+                )
+        self._conf = conf_threshold
+
+    @property
+    def active_provider(self) -> str:
+        return self._session.get_providers()[0]
+
+    def effective_batch_size(self, requested: int) -> int:
+        return self._static_batch or requested
+
+    def predict(
+        self, tiles_rgb: list[np.ndarray]
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Runs HxWx3 uint8 RGB tiles; returns (xyxy boxes, scores) per tile."""
+        step = self._static_batch or len(tiles_rgb)
+        results: list[tuple[np.ndarray, np.ndarray]] = []
+        for start in range(0, len(tiles_rgb), step):
+            results.extend(self._run_batch(tiles_rgb[start : start + step]))
+        return results
+
+    def _run_batch(
+        self, tiles_rgb: list[np.ndarray]
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        batch = np.stack(tiles_rgb).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        batch = np.ascontiguousarray(batch, dtype=self._input_dtype)
+
+        # Static-batch exports need a full batch; pad and drop the extra outputs.
+        pad = 0
+        if self._static_batch is not None and len(batch) < self._static_batch:
+            pad = self._static_batch - len(batch)
+            filler = np.zeros((pad, *batch.shape[1:]), dtype=batch.dtype)
+            batch = np.concatenate([batch, filler])
+
+        raw = self._session.run(None, {self._input_name: batch})[0]
+        raw = np.asarray(raw, dtype=np.float32)[: len(raw) - pad]
+        return [self._decode(sample) for sample in raw]
+
+    def _decode(self, pred: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        limit = float(PATCH_PIXEL_DIMENSION)
+        if pred.shape[0] > pred.shape[1]:
+            # End-to-end layout (N, 6): already xyxy + score, NMS done in-graph.
+            keep = pred[:, 4] > self._conf
+            boxes, scores = pred[keep, :4], pred[keep, 4]
+        else:
+            # Raw layout (4 + nc, N): class-agnostic score, xywh -> xyxy, then NMS.
+            scores_all = pred[4:].max(axis=0)
+            keep = scores_all > self._conf
+            cx, cy, w, h = pred[:4, keep]
+            scores = scores_all[keep]
+            boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
+            kept = non_max_suppression(boxes, scores, PATCH_NMS_IOU_THRESHOLD)
+            kept = kept[:PATCH_MAX_DETECTIONS]
+            boxes, scores = boxes[kept], scores[kept]
+        return np.clip(boxes, 0.0, limit), scores
+
+
 class EsophaInferenceWorker(QObject):
     """Asynchronous worker for patched sliding-window inference and cell extraction."""
 
@@ -1290,16 +1493,14 @@ class EsophaInferenceWorker(QObject):
     def run(self) -> None:
         slide_handle = None
         try:
-            if YOLO is None:
-                raise ImportError(
-                    "Ultralytics YOLO is required: pip install ultralytics"
-                )
-
-            self.status_updated.emit(
-                "Initializing neural network on computing device..."
+            self.status_updated.emit("Loading ONNX model...")
+            detector = OnnxEosinophilDetector(
+                self._config.model_weights_path, BASE_TENSOR_EXTRACTION_CONFIDENCE
             )
-            target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            detector = YOLO(self._config.model_weights_path)
+            batch_size = detector.effective_batch_size(self._config.batch_size)
+            self.status_updated.emit(
+                f"Model ready on {describe_provider(detector.active_provider)}."
+            )
 
             slide_handle = openslide.OpenSlide(self._slide_path)
             full_w, full_h = self._spec.width_px, self._spec.height_px
@@ -1339,94 +1540,59 @@ class EsophaInferenceWorker(QObject):
                             scheduled_patches.append((px, py, pw, ph))
 
             total_patches = len(scheduled_patches)
-            self.status_updated.emit(
-                f"Evaluating {total_patches:,} tissue patches with YOLO..."
-            )
+            self.status_updated.emit(f"Evaluating {total_patches:,} tissue patches...")
             self.progress_updated.emit(0, total_patches, 0)
 
             collected_boxes: list[list[float]] = []
             collected_scores: list[float] = []
-            batch_images: list[Image.Image] = []
+            batch_tiles: list[np.ndarray] = []
             batch_metadata: list[tuple[int, int, int, int]] = []
 
-            with torch.inference_mode():
-                for idx, (px, py, pw, ph) in enumerate(scheduled_patches):
-                    if self._cancel_signal.is_set():
-                        self.inference_cancelled.emit()
-                        return
+            for idx, (px, py, pw, ph) in enumerate(scheduled_patches):
+                if self._cancel_signal.is_set():
+                    self.inference_cancelled.emit()
+                    return
 
-                    tile_rgba = slide_handle.read_region((px, py), 0, (pw, ph))
-                    tile_rgb = tile_rgba.convert("RGB")
-                    tile_rgba.close()
+                tile_rgba = slide_handle.read_region((px, py), 0, (pw, ph))
+                tile_rgb = tile_rgba.convert("RGB")
+                tile_rgba.close()
 
-                    if pw != PATCH_PIXEL_DIMENSION or ph != PATCH_PIXEL_DIMENSION:
-                        tile_resized = tile_rgb.resize(
-                            (PATCH_PIXEL_DIMENSION, PATCH_PIXEL_DIMENSION),
-                            Image.Resampling.BILINEAR,
-                        )
-                        tile_rgb.close()
-                        tile_rgb = tile_resized
+                if pw != PATCH_PIXEL_DIMENSION or ph != PATCH_PIXEL_DIMENSION:
+                    tile_resized = tile_rgb.resize(
+                        (PATCH_PIXEL_DIMENSION, PATCH_PIXEL_DIMENSION),
+                        Image.Resampling.BILINEAR,
+                    )
+                    tile_rgb.close()
+                    tile_rgb = tile_resized
 
-                    batch_images.append(tile_rgb)
-                    batch_metadata.append((px, py, pw, ph))
+                batch_tiles.append(np.asarray(tile_rgb))
+                tile_rgb.close()
+                batch_metadata.append((px, py, pw, ph))
 
-                    if (
-                        len(batch_images) == self._config.batch_size
-                        or idx == total_patches - 1
+                if len(batch_tiles) == batch_size or idx == total_patches - 1:
+                    results = detector.predict(batch_tiles)
+
+                    for (cx, cy, cw, ch), (boxes_arr, scores_arr) in zip(
+                        batch_metadata, results, strict=True
                     ):
-                        results = detector.predict(
-                            source=batch_images,
-                            conf=BASE_TENSOR_EXTRACTION_CONFIDENCE,
-                            device=target_device,
-                            verbose=False,
-                        )
-
-                        for (cx, cy, cw, ch), patch_res in zip(
-                            batch_metadata, results, strict=False
-                        ):
-                            boxes_wrapper: Any = getattr(patch_res, "boxes", None)
-                            if boxes_wrapper is None:
-                                continue
-
-                            tensor_xyxy = getattr(boxes_wrapper, "xyxy", None)
-                            tensor_conf = getattr(boxes_wrapper, "conf", None)
-                            if tensor_xyxy is None or tensor_conf is None:
-                                continue
-
-                            boxes_arr = tensor_xyxy.detach().cpu().numpy()
-                            scores_arr = tensor_conf.detach().cpu().numpy()
-
-                            sx = cw / float(PATCH_PIXEL_DIMENSION)
-                            sy = ch / float(PATCH_PIXEL_DIMENSION)
-
-                            for b, s in zip(boxes_arr, scores_arr, strict=False):
-                                collected_boxes.append(
-                                    [
-                                        cx + b[0] * sx,
-                                        cy + b[1] * sy,
-                                        cx + b[2] * sx,
-                                        cy + b[3] * sy,
-                                    ]
-                                )
-                                collected_scores.append(float(s))
-
-                        for img in batch_images:
-                            img.close()
-                        batch_images.clear()
-                        batch_metadata.clear()
-
-                        # Emit throttled progress update
-                        if (idx % 16 == 0) or (idx == total_patches - 1):
-                            self.progress_updated.emit(
-                                idx + 1, total_patches, len(collected_boxes)
+                        sx = cw / float(PATCH_PIXEL_DIMENSION)
+                        sy = ch / float(PATCH_PIXEL_DIMENSION)
+                        for box, score in zip(boxes_arr, scores_arr, strict=True):
+                            collected_boxes.append(
+                                [
+                                    cx + box[0] * sx,
+                                    cy + box[1] * sy,
+                                    cx + box[2] * sx,
+                                    cy + box[3] * sy,
+                                ]
                             )
+                            collected_scores.append(float(score))
 
-                        # Clean VRAM every 64 batches to protect memory
-                        if (
-                            idx % (self._config.batch_size * 4) == 0
-                            and torch.cuda.is_available()
-                        ):
-                            torch.cuda.empty_cache()
+                    batch_tiles.clear()
+                    batch_metadata.clear()
+                    self.progress_updated.emit(
+                        idx + 1, total_patches, len(collected_boxes)
+                    )
 
             self.status_updated.emit("Applying slide-level NMS merge...")
             boxes_np = np.array(collected_boxes, dtype=np.float32)
@@ -1434,7 +1600,7 @@ class EsophaInferenceWorker(QObject):
             del collected_boxes, collected_scores
             gc.collect()
 
-            retained_indices = apply_slide_wide_nms(
+            retained_indices = non_max_suppression(
                 boxes_np, scores_np, self._config.nms_iou_threshold
             )
 
@@ -1474,8 +1640,6 @@ class EsophaInferenceWorker(QObject):
         finally:
             if slide_handle:
                 slide_handle.close()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             gc.collect()
             self.worker_finished.emit()
 
@@ -1650,6 +1814,7 @@ class EsophaScopeWindow(QMainWindow):
         super().__init__()
         self._config = config
         self.setWindowTitle("EsophaScope — Quantitative WSI Hotspot Diagnostics")
+        self.setWindowIcon(load_app_icon())
         self.resize(1420, 920)
         self.setAcceptDrops(True)
 
@@ -1665,6 +1830,10 @@ class EsophaScopeWindow(QMainWindow):
         self._inference_worker: EsophaInferenceWorker | None = None
         self._state = WorkbenchOperationalState.READY
         self._close_pending = False
+
+        # White glyphs: both icons sit on the filled primary/critical button.
+        self._icon_play = build_svg_icon("play", COLOR_TEXT_LIGHT)
+        self._icon_stop = build_svg_icon("stop", COLOR_TEXT_LIGHT)
 
         self._setup_ui()
         self._setup_shortcuts()
@@ -1713,7 +1882,15 @@ class EsophaScopeWindow(QMainWindow):
         toggle_layout.setContentsMargins(0, 0, 0, 0)
         toggle_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self._btn_toggle_sidebar = QPushButton("‹")
+        self._btn_toggle_sidebar = QPushButton()
+        self._icon_sidebar_closed = build_svg_icon(
+            "chevron-left", "#64748B", active_color=COLOR_ACCENT_BASE
+        )
+        self._icon_sidebar_open = build_svg_icon(
+            "chevron-right", "#64748B", active_color=COLOR_ACCENT_BASE
+        )
+        self._btn_toggle_sidebar.setIcon(self._icon_sidebar_closed)
+        self._btn_toggle_sidebar.setIconSize(QSize(14, 14))
         self._btn_toggle_sidebar.setObjectName("btnSidebarToggle")
         self._btn_toggle_sidebar.setToolTip("Toggle diagnostics and metrics sidebar")
         self._btn_toggle_sidebar.clicked.connect(self._toggle_sidebar)
@@ -1769,7 +1946,9 @@ class EsophaScopeWindow(QMainWindow):
         self._hud_fader.calibrate_requested.connect(self._auto_calibrate_f1)
 
         # Hotspot Focus FAB with Left and Bottom Margins
-        self._btn_fab_hotspot = QPushButton("+", self._viewport)
+        self._btn_fab_hotspot = QPushButton(self._viewport)
+        self._btn_fab_hotspot.setIcon(build_svg_icon("crosshair", COLOR_TEXT_LIGHT))
+        self._btn_fab_hotspot.setIconSize(QSize(20, 20))
         self._btn_fab_hotspot.setObjectName("btnHotspotFAB")
         self._btn_fab_hotspot.setToolTip("Center on diagnostic peak HPF field")
         self._btn_fab_hotspot.setEnabled(False)
@@ -1786,22 +1965,17 @@ class EsophaScopeWindow(QMainWindow):
         vbox = QVBoxLayout(toolbar)
         vbox.setContentsMargins(10, 8, 10, 8)
         vbox.setSpacing(6)
-        widget_style = self.style()
 
         actions = QHBoxLayout()
         actions.setSpacing(10)
 
         self._btn_open_slide = QPushButton("Open WSI Slide")
-        self._btn_open_slide.setIcon(
-            widget_style.standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton)
-        )
+        self._btn_open_slide.setIcon(build_svg_icon("folder"))
         self._btn_open_slide.clicked.connect(self._prompt_open_slide)
         actions.addWidget(self._btn_open_slide)
 
         self._btn_open_gt = QPushButton("Load GeoJSON")
-        self._btn_open_gt.setIcon(
-            widget_style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
-        )
+        self._btn_open_gt.setIcon(build_svg_icon("file-text"))
         self._btn_open_gt.clicked.connect(self._prompt_open_gt)
         actions.addWidget(self._btn_open_gt)
 
@@ -1809,18 +1983,14 @@ class EsophaScopeWindow(QMainWindow):
 
         self._btn_run_cancel = QPushButton("Run Tiled Inference")
         self._btn_run_cancel.setProperty("role", "primary")
-        self._btn_run_cancel.setIcon(
-            widget_style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
-        )
+        self._btn_run_cancel.setIcon(self._icon_play)
         self._btn_run_cancel.clicked.connect(self._on_run_or_cancel_clicked)
         actions.addWidget(self._btn_run_cancel)
 
         actions.addWidget(self._create_divider())
 
         self._btn_export_geojson = QPushButton("Export QuPath GeoJSON")
-        self._btn_export_geojson.setIcon(
-            widget_style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
-        )
+        self._btn_export_geojson.setIcon(build_svg_icon("download"))
         self._btn_export_geojson.clicked.connect(self._export_geojson)
         actions.addWidget(self._btn_export_geojson)
 
@@ -1963,14 +2133,14 @@ class EsophaScopeWindow(QMainWindow):
         self._pill_state.setObjectName("hudStatePill")
         self._pill_state.setProperty("state", "ready")
 
-        self._pill_slide = QLabel("📁 No slide loaded")
+        self._pill_slide = QLabel("No slide loaded")
         self._pill_slide.setObjectName("hudInfoPill")
 
-        self._pill_detections = QLabel("🔬 Detections: 0")
+        self._pill_detections = QLabel("Detections: 0")
         self._pill_detections.setObjectName("hudInfoPill")
         self._pill_detections.setProperty("numeric", "true")
 
-        self._pill_hotspot = QLabel("🔥 Peak HPF: —")
+        self._pill_hotspot = QLabel("Peak HPF: —")
         self._pill_hotspot.setObjectName("hudInfoPill")
 
         ribbon.addWidget(self._pill_state)
@@ -1979,12 +2149,8 @@ class EsophaScopeWindow(QMainWindow):
         ribbon.addWidget(self._pill_hotspot)
         ribbon.addStretch(1)
 
-        device_identity = (
-            f"CUDA ({torch.cuda.get_device_name(0)})"
-            if torch.cuda.is_available()
-            else "CPU Mode"
-        )
-        self._pill_hardware = QLabel(f"⚡ {device_identity}")
+        device_identity = describe_provider(select_execution_providers()[0])
+        self._pill_hardware = QLabel(device_identity)
         self._pill_hardware.setObjectName("hudHardwarePill")
         ribbon.addWidget(self._pill_hardware)
 
@@ -2029,7 +2195,9 @@ class EsophaScopeWindow(QMainWindow):
     def _toggle_sidebar(self) -> None:
         visible = not self._sidebar_panel.isVisible()
         self._sidebar_panel.setVisible(visible)
-        self._btn_toggle_sidebar.setText("›" if visible else "‹")
+        self._btn_toggle_sidebar.setIcon(
+            self._icon_sidebar_open if visible else self._icon_sidebar_closed
+        )
 
     def _reset_workspace(self) -> None:
         """Clears all loaded slides, annotations, and UI state."""
@@ -2059,9 +2227,9 @@ class EsophaScopeWindow(QMainWindow):
         self._ground_truth.clear()
         self._hotspot = None
 
-        self._pill_slide.setText("📁 No slide loaded")
-        self._pill_detections.setText("🔬 Detections: 0")
-        self._pill_hotspot.setText("🔥 Peak HPF: —")
+        self._pill_slide.setText("No slide loaded")
+        self._pill_detections.setText("Detections: 0")
+        self._pill_hotspot.setText("Peak HPF: —")
         self._progress_bar.setValue(0)
         self._lbl_progress_detail.setText("0 / 0 patches")
 
@@ -2184,7 +2352,7 @@ class EsophaScopeWindow(QMainWindow):
             self._tissue_overlay_item.setScale(w / float(tw))
             self._tissue_overlay_item.setVisible(self._chk_tissue.isChecked())
 
-            self._pill_slide.setText(f"📁 {self._slide_spec.file_name}")
+            self._pill_slide.setText(self._slide_spec.file_name)
             self._lbl_meta_dims.setText(f"{w:,} × {h:,} px")
             self._lbl_meta_mpp.setText(f"{mpp_x:.4f} × {mpp_y:.4f} µm/px")
             self._lbl_meta_vendor.setText(f"{vendor} ({mag}x)")
@@ -2245,15 +2413,9 @@ class EsophaScopeWindow(QMainWindow):
         self._inference_thread.started.connect(self._inference_worker.run)
         self._inference_worker.progress_updated.connect(self._on_progress)
         self._inference_worker.status_updated.connect(self._log_status)
-        self._inference_worker.inference_failed.connect(
-            lambda msg: QMessageBox.critical(self, "Inference Failed", msg)
-        )
+        self._inference_worker.inference_failed.connect(self._on_inference_failed)
         self._inference_worker.inference_finished.connect(self._on_inference_finished)
-        self._inference_worker.inference_cancelled.connect(
-            lambda: self._transition_state(
-                WorkbenchOperationalState.CANCELLED, "Inference cancelled."
-            )
-        )
+        self._inference_worker.inference_cancelled.connect(self._on_inference_cancelled)
 
         self._inference_worker.worker_finished.connect(self._inference_thread.quit)
         self._inference_worker.worker_finished.connect(
@@ -2278,7 +2440,7 @@ class EsophaScopeWindow(QMainWindow):
     def _on_progress(self, current: int, total: int, count: int) -> None:
         self._progress_bar.setMaximum(max(1, total))
         self._progress_bar.setValue(current)
-        self._pill_detections.setText(f"🔬 Detections: {count:,}")
+        self._pill_detections.setText(f"Detections: {count:,}")
         pct = (current / max(1, total)) * 100.0
         self._lbl_progress_detail.setText(f"{current:,} / {total:,} ({pct:.1f}%)")
 
@@ -2293,7 +2455,24 @@ class EsophaScopeWindow(QMainWindow):
             WorkbenchOperationalState.COMPLETED,
             f"Done: {len(self._visible_cells):,} eosinophils identified.",
         )
-        if getattr(self, "_close_pending", False):
+        if self._close_pending:
+            self.close()
+
+    @Slot(str)
+    def _on_inference_failed(self, message: str) -> None:
+        # Without this transition a failed run (e.g. missing model) left the UI
+        # stuck in EXECUTING.
+        self._transition_state(WorkbenchOperationalState.ERROR, "Inference failed.")
+        QMessageBox.critical(self, "Inference Failed", message)
+        if self._close_pending:
+            self.close()
+
+    @Slot()
+    def _on_inference_cancelled(self) -> None:
+        self._transition_state(
+            WorkbenchOperationalState.CANCELLED, "Inference cancelled."
+        )
+        if self._close_pending:
             self.close()
 
     def _on_confidence_changed(self, conf: float) -> None:
@@ -2395,7 +2574,7 @@ class EsophaScopeWindow(QMainWindow):
     def _apply_confidence_filtering(self) -> None:
         th = self._config.confidence_threshold
         self._visible_cells = [c for c in self._all_cells if c.confidence >= th]
-        self._pill_detections.setText(f"🔬 Detections: {len(self._visible_cells):,}")
+        self._pill_detections.setText(f"Detections: {len(self._visible_cells):,}")
 
         boxes = [c.bbox_coordinates for c in self._visible_cells]
         self._cell_overlay.set_vector_data(boxes)
@@ -2408,11 +2587,9 @@ class EsophaScopeWindow(QMainWindow):
             self._btn_fab_hotspot.setEnabled(self._hotspot is not None)
 
             if self._hotspot:
-                self._pill_hotspot.setText(
-                    f"🔥 Peak HPF: {self._hotspot.peak_count} eos"
-                )
+                self._pill_hotspot.setText(f"Peak HPF: {self._hotspot.peak_count} eos")
             else:
-                self._pill_hotspot.setText("🔥 Peak HPF: —")
+                self._pill_hotspot.setText("Peak HPF: —")
 
         self._update_metrics_view()
 
@@ -2507,7 +2684,6 @@ class EsophaScopeWindow(QMainWindow):
     def _sync_control_states(self) -> None:
         busy = self._is_worker_busy()
         has_slide = self._slide_spec is not None
-        widget_style = self.style()
 
         self._btn_open_slide.setEnabled(not busy)
         self._btn_open_gt.setEnabled(not busy)
@@ -2518,9 +2694,7 @@ class EsophaScopeWindow(QMainWindow):
         if self._state == WorkbenchOperationalState.EXECUTING:
             self._btn_run_cancel.setText("Cancel Inference")
             self._btn_run_cancel.setProperty("role", "critical")
-            self._btn_run_cancel.setIcon(
-                widget_style.standardIcon(QStyle.StandardPixmap.SP_MediaStop)
-            )
+            self._btn_run_cancel.setIcon(self._icon_stop)
             self._btn_run_cancel.setEnabled(True)
         elif self._state == WorkbenchOperationalState.CANCELLING:
             self._btn_run_cancel.setText("Cancelling...")
@@ -2528,9 +2702,7 @@ class EsophaScopeWindow(QMainWindow):
         else:
             self._btn_run_cancel.setText("Run Tiled Inference")
             self._btn_run_cancel.setProperty("role", "primary")
-            self._btn_run_cancel.setIcon(
-                widget_style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
-            )
+            self._btn_run_cancel.setIcon(self._icon_play)
             self._btn_run_cancel.setEnabled(has_slide)
 
         self._refresh_styling(self._btn_run_cancel)
@@ -2586,12 +2758,21 @@ def main() -> None:
     parser.add_argument(
         "--model",
         dest="model_path",
-        default=DEFAULT_MODEL_WEIGHTS,
-        help="Path to trained YOLO detector weights (*.pt)",
+        default=str(resource_path(DEFAULT_MODEL_WEIGHTS)),
+        help="Path to the exported YOLO detector (*.onnx)",
     )
     args = parser.parse_args()
 
+    if sys.platform == "win32":
+        # Own AppUserModelID so the taskbar shows our icon, not python.exe's.
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+
     app = QApplication(sys.argv)
+    app.setApplicationName("EsophaScope")
+    app.setDesktopFileName(APP_ID)  # links the window to its icon on Linux
+    app.setWindowIcon(load_app_icon())
     app.setStyleSheet(build_workbench_stylesheet())
     workbench = EsophaScopeWindow(EsophaScopeConfig(model_weights_path=args.model_path))
     workbench.show()

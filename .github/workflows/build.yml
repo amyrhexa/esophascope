@@ -1,0 +1,146 @@
+name: Build Standalone Executables
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target_os: linux
+            artifact_name: esophascope-linux-x86_64.tar.gz
+            binary_path: dist/esophascope-linux-x86_64.tar.gz
+          - os: windows-2025
+            target_os: windows
+            artifact_name: esophascope-windows-x86_64.exe
+            binary_path: dist/esophascope.exe
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Verify ONNX model
+        shell: bash
+        run: |
+          if [ ! -s "best.onnx" ]; then
+            echo "::error::'best.onnx' is missing or uncommitted (check .gitignore or Git LFS)."
+            exit 1
+          fi
+          size=$(wc -c < best.onnx)
+          if [ "$size" -lt 1000000 ]; then
+            echo "::error::'best.onnx' is only $size bytes. Ensure Git LFS pulled the actual weights."
+            exit 1
+          fi
+
+      - name: Install Linux dependencies
+        if: matrix.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache patchelf libopenslide-dev libgl1 libegl1 libxkbcommon-x11-0
+
+      - name: Download Windows OpenSlide binaries
+        if: matrix.target_os == 'windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/openslide/openslide-winbuild/releases/download/v20231011/openslide-win64-20231011.zip" -OutFile "openslide.zip"
+          Expand-Archive -Path "openslide.zip" -DestinationPath "$env:RUNNER_TEMP\openslide"
+          $binPath = (Get-ChildItem -Path "$env:RUNNER_TEMP\openslide" -Filter "bin" -Recurse -Directory | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Path "openslide_dlls" -Force | Out-Null
+          Copy-Item -Path "$binPath\*.dll" -Destination "openslide_dlls" -Force
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install nuitka zstandard ordered-set
+
+      - name: Compile with Nuitka (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          EXTRA_DATA=()
+          [ -s "app.ico" ] && EXTRA_DATA+=(--include-data-files=app.ico=app.ico)
+
+          python -m nuitka \
+            --onefile \
+            --enable-plugin=pyside6 \
+            --include-package-data=onnxruntime \
+            --include-data-files=best.onnx=best.onnx \
+            "${EXTRA_DATA[@]}" \
+            --assume-yes-for-downloads \
+            --output-dir=dist \
+            --output-filename=esophascope.bin \
+            esophascope.py
+
+      - name: Compile with Nuitka (Windows)
+        if: matrix.target_os == 'windows'
+        shell: pwsh
+        run: |
+          $extraFlags = @()
+          if (Test-Path "app.ico") {
+            $extraFlags += "--include-data-files=app.ico=app.ico"
+            $extraFlags += "--windows-icon-from-ico=app.ico"
+          }
+
+          python -m nuitka `
+            --onefile `
+            --enable-plugin=pyside6 `
+            --include-package-data=onnxruntime `
+            --include-data-files=best.onnx=best.onnx `
+            "--include-data-files=openslide_dlls/*.dll=./" `
+            --windows-console-mode=disable `
+            --assume-yes-for-downloads `
+            --output-dir=dist `
+            --output-filename=esophascope.exe `
+            @extraFlags `
+            esophascope.py
+
+      - name: Package Linux binary
+        if: matrix.target_os == 'linux'
+        run: tar -C dist -czf dist/esophascope-linux-x86_64.tar.gz esophascope.bin
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary_path }}
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          generate_release_notes: true
