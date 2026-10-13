@@ -1,0 +1,8 @@
+- module-name: "openslide_bin"
+  dlls:
+    - from_filenames:
+        prefixes:
+          - "libopenslide"
+        suffixes:
+          - "dll"
+      when: "win32"
