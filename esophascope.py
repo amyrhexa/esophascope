@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import datetime
-import gc
 import json
 import logging
 import math
+import os
 import sys
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from collections.abc import Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -33,6 +36,7 @@ from PySide6.QtCore import (
     QRectF,
     QRunnable,
     QSize,
+    QStandardPaths,
     Qt,
     QThread,
     QThreadPool,
@@ -43,6 +47,7 @@ from PySide6.QtGui import (
     QCloseEvent,
     QColor,
     QDragEnterEvent,
+    QDragLeaveEvent,
     QDragMoveEvent,
     QDropEvent,
     QIcon,
@@ -54,6 +59,7 @@ from PySide6.QtGui import (
     QPolygonF,
     QResizeEvent,
     QShortcut,
+    QTransform,
     QWheelEvent,
 )
 from PySide6.QtSvg import QSvgRenderer
@@ -95,6 +101,8 @@ APP_ICON_FILE = "app.ico"
 DEFAULT_MODEL_WEIGHTS = "best.onnx"
 TARGET_MODEL_MPP = 0.173
 PATCH_PIXEL_DIMENSION = 640
+# Fill for the unused area of edge patches (Ultralytics letterbox grey).
+PATCH_PAD_VALUE = 114
 PATCH_MICRON_SPAN = PATCH_PIXEL_DIMENSION * TARGET_MODEL_MPP
 
 # Standard clinical HPF area: 0.238 mm²
@@ -112,12 +120,19 @@ SLIDE_NMS_IOU_THRESHOLD = 0.45
 PATCH_NMS_IOU_THRESHOLD = 0.7
 PATCH_MAX_DETECTIONS = 300
 PATCH_STRIDE_OVERLAP_RATIO = 0.20
-TISSUE_SATURATION_FLOOR = 25
 TISSUE_COVERAGE_MINIMUM_FRACTION = 0.05
 OVERVIEW_THUMBNAIL_MAX_DIMENSION = 2048
 INFERENCE_BATCH_CAPACITY = 8
-PYRAMIDAL_TILE_EDGE_PX = 640
-MAX_CONCURRENT_TILE_TASKS = 4
+# Tile edge in *pyramid-level* pixels (matches common 256/512 px scanner tiles).
+PYRAMIDAL_TILE_EDGE_PX = 512
+TILE_FETCH_MAX_RETRIES = 2
+TILE_CACHE_MIN_BYTES = 256 * 1024**2
+TILE_CACHE_MAX_BYTES = 1024 * 1024**2
+TILE_CACHE_RAM_FRACTION = 0.04
+PLAUSIBLE_MPP_RANGE_UM = (0.05, 2.0)
+MODEL_LOAD_POLL_SECONDS = 0.1
+SLIDE_EXTENSIONS = frozenset({".svs", ".ndpi", ".mrxs", ".tif", ".tiff"})
+ANNOTATION_EXTENSIONS = frozenset({".geojson", ".json"})
 
 # Viewport HUD Margin Defaults
 DEFAULT_HPF_BUTTON_MARGIN_LEFT = 70
@@ -151,6 +166,52 @@ def resource_path(relative: str) -> Path:
     """Resolves a bundled asset for both source runs and PyInstaller builds."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / relative
+
+
+class _WindowsMemoryStatus(ctypes.Structure):
+    """MEMORYSTATUSEX, used only on Windows to read total physical memory."""
+
+    _fields_ = (
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    )
+
+
+def total_physical_memory_bytes() -> int:
+    """Total installed RAM; falls back to 4 GiB when the platform cannot say."""
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, ValueError, OSError):
+        pass
+    if sys.platform == "win32":
+        status = _WindowsMemoryStatus()
+        status.dwLength = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullTotalPhys)
+    return 4 * 1024**3
+
+
+def tile_cache_budget_bytes() -> int:
+    """Viewport tile cache budget: a small fraction of RAM, clamped to sane bounds."""
+    budget = int(total_physical_memory_bytes() * TILE_CACHE_RAM_FRACTION)
+    return max(TILE_CACHE_MIN_BYTES, min(TILE_CACHE_MAX_BYTES, budget))
+
+
+def tile_worker_count() -> int:
+    """Concurrent viewport tile decoders: scales with CPU count, bounded to 2-6."""
+    return max(2, min(6, os.cpu_count() or 2))
+
+
+def patch_reader_count() -> int:
+    """Read-ahead threads for inference; leaves cores for the ONNX Runtime session."""
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
 
 
 # 24x24 stroke glyphs (Lucide-style). Rendered from SVG at several pixel sizes so
@@ -455,6 +516,30 @@ def build_workbench_stylesheet() -> str:
         font-size: 8.5pt;
         font-weight: 700;
     }}
+    QLabel#hudHardwarePill[modelState="loading"] {{
+        background: rgba(100, 116, 139, 0.10);
+        color: #475569;
+        border: 1px solid rgba(100, 116, 139, 0.30);
+    }}
+    QLabel#hudHardwarePill[modelState="warning"] {{
+        background: rgba(245, 158, 11, 0.12);
+        color: #B45309;
+        border: 1px solid rgba(245, 158, 11, 0.35);
+    }}
+    QLabel#hudHardwarePill[modelState="error"] {{
+        background: rgba(220, 38, 38, 0.10);
+        color: #DC2626;
+        border: 1px solid rgba(220, 38, 38, 0.30);
+    }}
+    QLabel#hudStatePill[state="loading"] {{
+        background: rgba(99, 102, 241, 0.10);
+        color: #4F46E5;
+        border: 1px solid rgba(99, 102, 241, 0.30);
+    }}
+    QLabel[calibration="fallback"] {{
+        color: #B45309;
+        font-weight: 700;
+    }}
     QLabel#hudProgressDetail {{
         font-size: 8.5pt;
         font-weight: 600;
@@ -541,7 +626,10 @@ class EsophaScopeConfig:
     nms_iou_threshold: float = SLIDE_NMS_IOU_THRESHOLD
     patch_overlap_ratio: float = PATCH_STRIDE_OVERLAP_RATIO
     batch_size: int = INFERENCE_BATCH_CAPACITY
-    tissue_sat_threshold: int = TISSUE_SATURATION_FLOOR
+    # Blue-chromaticity display mapping; None = stretch to the slide's own range.
+    blue_chromaticity_min: float | None = None
+    blue_chromaticity_max: float | None = None
+    blue_chromaticity_gamma: float = 1.0
     tissue_min_coverage: float = TISSUE_COVERAGE_MINIMUM_FRACTION
     centroid_tolerance_um: float = CENTROID_MATCH_TOLERANCE_UM
     thumbnail_max_dimension: int = OVERVIEW_THUMBNAIL_MAX_DIMENSION
@@ -593,6 +681,8 @@ class SlideSpecification:
     level_dimensions: list[tuple[int, int]]
     level_downsamples: list[float]
     tissue_surface_area_mm2: float = 0.0
+    mpp_is_fallback: bool = False
+    calibration_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -656,28 +746,103 @@ def non_max_suppression(
     return kept
 
 
-def generate_tissue_mask_hsv(
-    thumbnail_rgb: np.ndarray, saturation_threshold: int = 25
+def blue_chromaticity(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Blue chromaticity B / (R + G + B) per pixel, as in QuPath.
+
+    Returns (chromaticity float32, valid bool). Pixels with R + G + B == 0 have no
+    defined chromaticity; they are marked invalid and given 0.
+    """
+    channels = rgb[:, :, :3].astype(np.float32)
+    total = channels.sum(axis=2)
+    valid = total > 0.0
+    chroma = np.zeros(total.shape, dtype=np.float32)
+    np.divide(channels[:, :, 2], total, out=chroma, where=valid)
+    return chroma, valid
+
+
+def apply_display_adjustment(
+    values: np.ndarray, channel_min: float, channel_max: float, gamma: float
 ) -> np.ndarray:
-    """Computes binary tissue mask from whole-slide overview using HSV thresholding."""
-    hsv_image = cv2.cvtColor(thumbnail_rgb, cv2.COLOR_RGB2HSV)
-    saturation = hsv_image[:, :, 1]
-    brightness = hsv_image[:, :, 2]
-    binary_tissue = ((saturation >= saturation_threshold) & (brightness <= 245)).astype(
-        np.uint8
-    ) * 255
+    """QuPath display mapping: clip((I - min) / (max - min), 0, 1) ** (1 / gamma)."""
+    if not channel_max > channel_min:
+        raise ValueError("Channel max must be greater than channel min.")
+    if not gamma > 0.0:
+        raise ValueError("Gamma must be positive.")
+    normalised = np.clip((values - channel_min) / (channel_max - channel_min), 0.0, 1.0)
+    return normalised ** (1.0 / gamma)
+
+
+def otsu_threshold(values_u8: np.ndarray) -> int:
+    """Otsu's threshold on 8-bit values: maximises between-class variance."""
+    histogram = np.bincount(values_u8.ravel(), minlength=256).astype(np.float64)
+    total = histogram.sum()
+    if total == 0:
+        return 0
+    levels = np.arange(256, dtype=np.float64)
+    weight_low = np.cumsum(histogram)
+    weight_high = total - weight_low
+    mean_cumulative = np.cumsum(histogram * levels)
+    mean_total = mean_cumulative[-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean_low = mean_cumulative / weight_low
+        mean_high = (mean_total - mean_cumulative) / weight_high
+        variance = weight_low * weight_high * (mean_low - mean_high) ** 2
+    variance[~np.isfinite(variance)] = -1.0
+    return int(np.argmax(variance))
+
+
+def generate_tissue_mask_blue_chromaticity(
+    thumbnail_rgb: np.ndarray,
+    channel_min: float | None = None,
+    channel_max: float | None = None,
+    gamma: float = 1.0,
+) -> np.ndarray:
+    """Binary tissue mask (0/255): blue chromaticity -> display mapping -> Otsu.
+
+    Channel min/max default to the 0.5th/99.5th percentiles of the slide's own
+    chromaticity (contrast stretch). Otsu splits the adjusted image into two
+    classes; tissue is the class with the lower mean luminance (darker than the
+    glass background). Returns an empty mask for a flat image.
+    """
+    chroma, valid = blue_chromaticity(thumbnail_rgb)
+    empty = np.zeros(chroma.shape, dtype=np.uint8)
+    if not valid.any():
+        return empty
+    observed = chroma[valid]
+    low = channel_min
+    high = channel_max
+    if low is None or high is None:
+        auto_low, auto_high = np.percentile(observed, (0.5, 99.5))
+        low = float(auto_low) if low is None else low
+        high = float(auto_high) if high is None else high
+    if not high > low:
+        return empty
+
+    adjusted = apply_display_adjustment(chroma, low, high, gamma)
+    levels = np.rint(adjusted * 255.0).astype(np.uint8)
+    threshold = otsu_threshold(levels[valid])
+    upper = valid & (levels > threshold)
+    lower = valid & ~upper
+    if not upper.any() or not lower.any():
+        return empty
+
+    luminance = thumbnail_rgb[:, :, :3].astype(np.float32) @ np.array(
+        [0.299, 0.587, 0.114], np.float32
+    )
+    tissue = upper if luminance[upper].mean() < luminance[lower].mean() else lower
+    binary_tissue = tissue.astype(np.uint8) * 255
     structuring_element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     return cv2.morphologyEx(
         binary_tissue, cv2.MORPH_CLOSE, structuring_element, iterations=2
     )
 
 
-def build_tissue_overlay_image(mask_binary: np.ndarray) -> Image.Image:
-    """Creates a transparent RGBA architectural overlay map for the tissue layer."""
+def build_tissue_overlay_rgba(mask_binary: np.ndarray) -> np.ndarray:
+    """Creates a transparent RGBA overlay array for the tissue layer."""
     h, w = mask_binary.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[mask_binary > 0] = [37, 99, 235, 75]
-    return Image.fromarray(rgba, mode="RGBA")
+    rgba[mask_binary > 0] = (37, 99, 235, 75)
+    return rgba
 
 
 def identify_peak_diagnostic_hpf(
@@ -940,32 +1105,298 @@ def serialize_qupath_geojson(
 
 
 # ==============================================================================
-# SECTION 3: THREAD-SAFE TILE STREAMING & PYRAMIDAL CANVAS GRAPHICS
+# SECTION 2B: ASYNCHRONOUS SLIDE LOADING
 # ==============================================================================
-class ThreadLocalSlideProvider:
-    """Manages thread-local OpenSlide instances to eliminate per-tile open/close overhead."""
+def _parse_mpp(raw: object) -> float | None:
+    """Parses one microns-per-pixel property; None when missing or unusable."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0.0 else None
 
-    def __init__(self, file_path: str):
+
+def resolve_slide_calibration(
+    raw_x: object, raw_y: object
+) -> tuple[float, float, bool, tuple[str, ...]]:
+    """Returns (mpp_x, mpp_y, used_fallback, notes) from raw OpenSlide MPP values.
+
+    Missing/invalid calibration is never hidden: whenever a value is substituted
+    (the other axis, or TARGET_MODEL_MPP when both are unusable) the flag is set
+    and a human-readable note is returned so the UI can report it.
+    """
+    mpp_x, mpp_y = _parse_mpp(raw_x), _parse_mpp(raw_y)
+    notes: list[str] = []
+    used_fallback = False
+
+    if mpp_x is None and mpp_y is None:
+        notes.append(
+            f"No valid MPP metadata (X={raw_x!r}, Y={raw_y!r}). Assuming "
+            f"{TARGET_MODEL_MPP} µm/px on both axes; physical measurements "
+            "(HPF area, density, tolerances) are NOT calibrated."
+        )
+        return TARGET_MODEL_MPP, TARGET_MODEL_MPP, True, tuple(notes)
+
+    if mpp_x is None:
+        notes.append(f"X MPP missing/invalid ({raw_x!r}); using the Y value {mpp_y}.")
+        mpp_x, used_fallback = mpp_y, True
+    elif mpp_y is None:
+        notes.append(f"Y MPP missing/invalid ({raw_y!r}); using the X value {mpp_x}.")
+        mpp_y, used_fallback = mpp_x, True
+
+    low, high = PLAUSIBLE_MPP_RANGE_UM
+    for axis, value in (("X", mpp_x), ("Y", mpp_y)):
+        if not low <= value <= high:
+            notes.append(
+                f"{axis} MPP {value} µm/px is outside the usual range "
+                f"{low}-{high}; verify the slide calibration."
+            )
+    return float(mpp_x), float(mpp_y), used_fallback, tuple(notes)
+
+
+@dataclass(frozen=True)
+class SlideLoadResult:
+    """Everything the GUI thread needs to show a freshly opened slide."""
+
+    spec: SlideSpecification
+    thumbnail_rgb: np.ndarray
+    tissue_mask: np.ndarray
+    tissue_overlay_rgba: np.ndarray
+
+
+class SlideLoadSignals(QObject):
+    status = Signal(int, str)
+    loaded = Signal(int, object)
+    failed = Signal(int, str)
+    finished = Signal(int)
+
+
+class SlideLoadTask(QRunnable):
+    """Opens a slide, reads metadata, builds the overview and tissue mask off-thread.
+
+    Only plain Python/NumPy data crosses back to the GUI thread; QPixmap and
+    scene items are created there. The OpenSlide handle is closed in every path.
+    """
+
+    def __init__(
+        self,
+        request_id: int,
+        slide_path: str,
+        config: EsophaScopeConfig,
+        signals: SlideLoadSignals,
+    ) -> None:
+        super().__init__()
+        # The window keeps a Python reference until `finished` arrives.
+        self.setAutoDelete(False)
+        self._request_id = request_id
+        self._slide_path = slide_path
+        self._config = config
+        self._signals = signals
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        rid = self._request_id
+        try:
+            result = self._load()
+            if result is not None and not self._cancel.is_set():
+                self._signals.loaded.emit(rid, result)
+        except (
+            openslide.OpenSlideError,
+            OSError,
+            ValueError,
+            RuntimeError,
+            MemoryError,
+            cv2.error,
+        ) as exc:
+            logger.exception("Failed to load slide %s", self._slide_path)
+            self._signals.failed.emit(rid, str(exc) or type(exc).__name__)
+        except Exception as exc:  # last resort: the GUI must always leave LOADING
+            logger.exception("Unexpected slide-loading failure")
+            self._signals.failed.emit(rid, f"{type(exc).__name__}: {exc}")
+        finally:
+            self._signals.finished.emit(rid)
+
+    def _load(self) -> SlideLoadResult | None:
+        rid = self._request_id
+        path = Path(self._slide_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Slide not found: {path}")
+
+        self._signals.status.emit(rid, f"Opening {path.name}...")
+        with openslide.OpenSlide(str(path)) as slide:
+            width, height = slide.dimensions
+            props = slide.properties
+            mpp_x, mpp_y, mpp_fallback, notes = resolve_slide_calibration(
+                props.get(openslide.PROPERTY_NAME_MPP_X),
+                props.get(openslide.PROPERTY_NAME_MPP_Y),
+            )
+            vendor = str(props.get(openslide.PROPERTY_NAME_VENDOR, "Generic Scanner"))
+            magnification = str(props.get("openslide.objective-power", "n/a"))
+            level_count = slide.level_count
+            level_dimensions = [tuple(d) for d in slide.level_dimensions]
+            level_downsamples = [float(d) for d in slide.level_downsamples]
+
+            if self._cancel.is_set():
+                return None
+            self._signals.status.emit(rid, "Generating overview thumbnail...")
+            scale = min(
+                self._config.thumbnail_max_dimension / float(width),
+                self._config.thumbnail_max_dimension / float(height),
+                1.0,
+            )
+            request_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+            thumbnail = np.ascontiguousarray(
+                np.asarray(slide.get_thumbnail(request_size).convert("RGB"))
+            )
+
+        if self._cancel.is_set():
+            return None
+        self._signals.status.emit(rid, "Computing tissue mask...")
+        # PIL may round the thumbnail by a pixel; always use the real array shape.
+        thumb_h, thumb_w = thumbnail.shape[:2]
+        tissue_mask = generate_tissue_mask_blue_chromaticity(
+            thumbnail,
+            self._config.blue_chromaticity_min,
+            self._config.blue_chromaticity_max,
+            self._config.blue_chromaticity_gamma,
+        )
+        tissue_pixels = int(np.count_nonzero(tissue_mask))
+        tissue_area_mm2 = (
+            tissue_pixels
+            * ((width / thumb_w) * mpp_x)
+            * ((height / thumb_h) * mpp_y)
+            / 1_000_000.0
+        )
+        spec = SlideSpecification(
+            slide_path=str(path),
+            file_name=path.name,
+            width_px=width,
+            height_px=height,
+            mpp_x=mpp_x,
+            mpp_y=mpp_y,
+            scanner_model=vendor,
+            magnification=magnification,
+            level_count=level_count,
+            level_dimensions=level_dimensions,
+            level_downsamples=level_downsamples,
+            tissue_surface_area_mm2=tissue_area_mm2,
+            mpp_is_fallback=mpp_fallback,
+            calibration_notes=notes,
+        )
+        return SlideLoadResult(
+            spec=spec,
+            thumbnail_rgb=thumbnail,
+            tissue_mask=tissue_mask,
+            tissue_overlay_rgba=build_tissue_overlay_rgba(tissue_mask),
+        )
+
+
+# ==============================================================================
+# SECTION 3: SLIDE HANDLE POOL, TILE STREAMING & PYRAMIDAL CANVAS GRAPHICS
+# ==============================================================================
+TileKey = tuple[int, int, int]  # (pyramid level, tile column, tile row)
+
+
+class SlideClosedError(RuntimeError):
+    """Raised when a handle is requested after its pool was shut down."""
+
+
+class SlideHandlePool:
+    """Bounded pool of OpenSlide handles shared by worker threads.
+
+    A handle serves one read at a time and handles are created lazily, so open
+    handles/file descriptors never exceed ``capacity`` even though QThreadPool
+    recycles its threads. ``shutdown()`` never closes a borrowed handle: the last
+    borrower to return closes everything.
+    """
+
+    def __init__(self, file_path: str, capacity: int) -> None:
         self._path = file_path
-        self._thread_local = threading.local()
-        self._open_handles: list[openslide.OpenSlide] = []
-        self._lock = threading.Lock()
+        self._capacity = max(1, capacity)
+        self._cond = threading.Condition()
+        self._idle: list[openslide.OpenSlide] = []
+        self._all: list[openslide.OpenSlide] = []
+        self._created = 0
+        self._borrowed = 0
+        self._closed = False
 
-    def obtain_handle(self) -> openslide.OpenSlide:
-        slide = getattr(self._thread_local, "handle", None)
-        if slide is None:
-            slide = openslide.OpenSlide(self._path)
-            self._thread_local.handle = slide
-            with self._lock:
-                self._open_handles.append(slide)
-        return slide
+    @contextlib.contextmanager
+    def borrow(self) -> Iterator[openslide.OpenSlide]:
+        handle = self._acquire()
+        try:
+            yield handle
+        finally:
+            self._release(handle)
+
+    def _acquire(self) -> openslide.OpenSlide:
+        with self._cond:
+            while True:
+                if self._closed:
+                    raise SlideClosedError(self._path)
+                if self._idle:
+                    self._borrowed += 1
+                    return self._idle.pop()
+                if self._created < self._capacity:
+                    self._created += 1
+                    self._borrowed += 1
+                    break
+                self._cond.wait()
+        try:
+            handle = openslide.OpenSlide(self._path)
+        except BaseException:
+            with self._cond:
+                self._created -= 1
+            self._release(None)
+            raise
+        with self._cond:
+            self._all.append(handle)
+        return handle
+
+    def _release(self, handle: openslide.OpenSlide | None) -> None:
+        with self._cond:
+            self._borrowed -= 1
+            if handle is not None and not self._closed:
+                self._idle.append(handle)
+            self._cond.notify()
+            close_now = self._closed and self._borrowed == 0
+        if close_now:
+            self._close_all()
 
     def shutdown(self) -> None:
-        with self._lock:
-            for handle in self._open_handles:
-                with contextlib.suppress(openslide.OpenSlideError, OSError):
-                    handle.close()
-            self._open_handles.clear()
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+            close_now = self._borrowed == 0
+        if close_now:
+            self._close_all()
+
+    def _close_all(self) -> None:
+        with self._cond:
+            handles, self._all = self._all, []
+            self._idle.clear()
+        for handle in handles:
+            with contextlib.suppress(openslide.OpenSlideError, OSError):
+                handle.close()
+
+
+def select_pyramid_level(downsamples: Sequence[float], screen_downsample: float) -> int:
+    """Coarsest level whose downsample does not exceed the on-screen downsample.
+
+    ``screen_downsample`` is level-0 pixels per device pixel (1 / effective zoom),
+    so the chosen level always has at least screen resolution.
+    """
+    level = 0
+    for index, ds in enumerate(downsamples):
+        if ds <= screen_downsample * (1.0 + 1e-6):
+            level = index
+        else:
+            break
+    return level
 
 
 class PyramidalTileSignals(QObject):
@@ -974,78 +1405,95 @@ class PyramidalTileSignals(QObject):
 
 
 class PyramidalTileFetchTask(QRunnable):
-    """Fetches and decodes OpenSlide pyramid tiles in parallel thread-pool workers."""
+    """Reads one pyramid tile and converts it to a paint-ready QImage off-thread."""
 
     def __init__(
         self,
-        provider: ThreadLocalSlideProvider,
-        level: int,
-        tile_x: int,
-        tile_y: int,
-        tile_w: int,
-        tile_h: int,
-        read_w: int,
-        read_h: int,
+        handles: SlideHandlePool,
+        key: TileKey,
+        origin_level0: tuple[int, int],
+        size: tuple[int, int],
         signals: PyramidalTileSignals,
-    ):
+        closed: threading.Event,
+    ) -> None:
         super().__init__()
-        self._provider = provider
-        self._level = level
-        self._tx = tile_x
-        self._ty = tile_y
-        self._tw = tile_w
-        self._th = tile_h
-        self._rw = read_w
-        self._rh = read_h
+        self._handles = handles
+        self._key = key
+        self._origin = origin_level0
+        self._size = size
         self._signals = signals
+        self._closed = closed
 
     def run(self) -> None:
+        if self._closed.is_set():
+            return
+        level, col, row = self._key
+        width, height = self._size
         try:
-            slide = self._provider.obtain_handle()
-            tile_rgba = slide.read_region(
-                (self._tx, self._ty), self._level, (self._rw, self._rh)
-            )
+            with self._handles.borrow() as slide:
+                tile = slide.read_region(self._origin, level, self._size)
+            raw = tile.tobytes()
+            tile.close()
+            # convertToFormat deep-copies, so `raw` may be released afterwards.
             image = QImage(
-                tile_rgba.tobytes(),
-                self._rw,
-                self._rh,
-                4 * self._rw,
-                QImage.Format.Format_RGBA8888,
-            ).copy()
-            self._signals.tile_ready.emit(self._level, self._tx, self._ty, image)
+                raw, width, height, 4 * width, QImage.Format.Format_RGBA8888
+            ).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        except SlideClosedError:
+            return
         except (openslide.OpenSlideError, OSError, RuntimeError, ValueError) as exc:
-            logger.debug(
-                "Tile streaming fault at level %d (%d, %d): %s",
-                self._level,
-                self._tx,
-                self._ty,
-                exc,
-            )
-            self._signals.tile_failed.emit(self._level, self._tx, self._ty)
+            logger.debug("Tile fault at level %d (%d, %d): %s", level, col, row, exc)
+            if not self._closed.is_set():
+                self._signals.tile_failed.emit(level, col, row)
+            return
+        if not self._closed.is_set():
+            self._signals.tile_ready.emit(level, col, row, image)
 
 
 class PyramidalSlideCanvas(QGraphicsItem):
-    """Interactive multi-resolution canvas item with true LRU tile caching."""
+    """Multi-resolution slide item: overview backdrop + viewport-driven tiles.
+
+    Coordinates: the scene is level-0 pixels. Tile (col, row) at level L covers
+    level-L pixels [col*T, col*T+w) x [row*T, row*T+h) with T = tile edge, which is
+    scene rect (col*T*ds, row*T*ds, w*ds, h*ds) and is read from level-0 origin
+    round(col*T*ds), round(row*T*ds) - the same ``ds`` OpenSlide itself uses.
+    """
 
     def __init__(
         self,
-        slide_path: str,
+        spec: SlideSpecification,
         overview_pixmap: QPixmap,
         parent: QGraphicsItem | None = None,
-    ):
+    ) -> None:
         super().__init__(parent)
-        self._slide_path = slide_path
-        self._overview_pixmap = overview_pixmap
-        self._provider = ThreadLocalSlideProvider(slide_path)
+        # Without this flag Qt reports the *whole* item as exposed on every paint.
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption, True)
+        self.setZValue(0.0)
 
-        inspection_handle = openslide.OpenSlide(slide_path)
-        self._dimensions = inspection_handle.dimensions
-        self._downsamples = list(inspection_handle.level_downsamples)
-        inspection_handle.close()
+        self._width = spec.width_px
+        self._height = spec.height_px
+        self._level_dims = [tuple(d) for d in spec.level_dimensions]
+        self._downsamples = list(spec.level_downsamples)
+        self._overview = overview_pixmap
+        self._overview_ds = max(
+            self._width / float(max(1, overview_pixmap.width())),
+            self._height / float(max(1, overview_pixmap.height())),
+        )
 
-        self._lru_tile_cache: OrderedDict[tuple[int, int, int], QPixmap] = OrderedDict()
-        self._active_requests: set[tuple[int, int, int]] = set()
-        self._cache_capacity = 128
+        workers = tile_worker_count()
+        self._handles = SlideHandlePool(spec.slide_path, workers)
+        self._pool = QThreadPool()
+        self._pool.setMaxThreadCount(workers)
+        self._max_in_flight = workers + 2
+
+        self._cache: OrderedDict[TileKey, QImage] = OrderedDict()
+        self._cache_bytes = 0
+        self._cache_budget = tile_cache_budget_bytes()
+        self._in_flight: set[TileKey] = set()
+        self._wanted: deque[TileKey] = deque()
+        self._failures: dict[TileKey, int] = {}
+        self._hits = 0
+        self._misses = 0
+        self._closed = threading.Event()
 
         self.signals = PyramidalTileSignals()
         self.signals.tile_ready.connect(
@@ -1054,35 +1502,122 @@ class PyramidalSlideCanvas(QGraphicsItem):
         self.signals.tile_failed.connect(
             self._on_tile_failed, Qt.ConnectionType.QueuedConnection
         )
-        self._thread_pool = QThreadPool()
-        self._thread_pool.setMaxThreadCount(MAX_CONCURRENT_TILE_TASKS)
-        self.setZValue(0.0)
 
+    # ---- geometry -----------------------------------------------------------
     def boundingRect(self) -> QRectF:
-        return QRectF(0, 0, self._dimensions[0], self._dimensions[1])
+        return QRectF(0, 0, self._width, self._height)
 
+    def tile_geometry(
+        self, level: int, col: int, row: int
+    ) -> tuple[tuple[int, int], tuple[int, int], QRectF]:
+        """(level-0 read origin, level-pixel size, scene rect) of a tile."""
+        ds = self._downsamples[level]
+        level_w, level_h = self._level_dims[level]
+        lx = col * PYRAMIDAL_TILE_EDGE_PX
+        ly = row * PYRAMIDAL_TILE_EDGE_PX
+        w = min(PYRAMIDAL_TILE_EDGE_PX, level_w - lx)
+        h = min(PYRAMIDAL_TILE_EDGE_PX, level_h - ly)
+        return (
+            (round(lx * ds), round(ly * ds)),
+            (w, h),
+            QRectF(lx * ds, ly * ds, w * ds, h * ds),
+        )
+
+    def tiles_for_rect(self, level: int, rect: QRectF) -> list[tuple[int, int]]:
+        """(col, row) of every level tile intersecting a level-0 scene rect."""
+        if rect.width() <= 0 or rect.height() <= 0:
+            return []
+        ds = self._downsamples[level]
+        level_w, level_h = self._level_dims[level]
+        edge = PYRAMIDAL_TILE_EDGE_PX
+        cols = math.ceil(level_w / edge)
+        rows = math.ceil(level_h / edge)
+        c0 = max(0, math.floor(rect.left() / ds / edge))
+        c1 = min(cols - 1, math.ceil(rect.right() / ds / edge) - 1)
+        r0 = max(0, math.floor(rect.top() / ds / edge))
+        r1 = min(rows - 1, math.ceil(rect.bottom() / ds / edge) - 1)
+        return [(c, r) for r in range(r0, r1 + 1) for c in range(c0, c1 + 1)]
+
+    def cache_stats(self) -> dict[str, float]:
+        lookups = self._hits + self._misses
+        return {
+            "tiles": len(self._cache),
+            "bytes": self._cache_bytes,
+            "budget": self._cache_budget,
+            "hit_rate": (self._hits / lookups) if lookups else 0.0,
+        }
+
+    # ---- lifecycle ----------------------------------------------------------
+    def close(self, wait: bool = False) -> None:
+        """Stops streaming. Handles close as soon as no worker is using them."""
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        self._wanted.clear()
+        self._in_flight.clear()
+        self._pool.clear()
+        if wait:
+            self._pool.waitForDone(3000)
+        self._handles.shutdown()
+        logger.debug("Tile cache at close: %s", self.cache_stats())
+        self._cache.clear()
+        self._cache_bytes = 0
+
+    # ---- tile arrival -------------------------------------------------------
     @Slot(int, int, int, QImage)
-    def _on_tile_ready(self, level: int, tx: int, ty: int, image: QImage) -> None:
-        tile_key = (level, tx, ty)
-        self._active_requests.discard(tile_key)
-        pix = QPixmap.fromImage(image)
-
-        if len(self._lru_tile_cache) >= self._cache_capacity:
-            self._lru_tile_cache.popitem(last=False)
-
-        self._lru_tile_cache[tile_key] = pix
-        self.update(QRectF(tx, ty, PYRAMIDAL_TILE_EDGE_PX, PYRAMIDAL_TILE_EDGE_PX))
+    def _on_tile_ready(self, level: int, col: int, row: int, image: QImage) -> None:
+        if self._closed.is_set():
+            return
+        key = (level, col, row)
+        self._in_flight.discard(key)
+        self._failures.pop(key, None)
+        previous = self._cache.pop(key, None)
+        if previous is not None:
+            self._cache_bytes -= previous.sizeInBytes()
+        self._cache[key] = image
+        self._cache_bytes += image.sizeInBytes()
+        while self._cache_bytes > self._cache_budget and len(self._cache) > 1:
+            _, evicted = self._cache.popitem(last=False)
+            self._cache_bytes -= evicted.sizeInBytes()
+        self.update(self.tile_geometry(level, col, row)[2])
+        self._pump()
 
     @Slot(int, int, int)
-    def _on_tile_failed(self, level: int, tx: int, ty: int) -> None:
-        self._active_requests.discard((level, tx, ty))
+    def _on_tile_failed(self, level: int, col: int, row: int) -> None:
+        key = (level, col, row)
+        self._in_flight.discard(key)
+        self._failures[key] = self._failures.get(key, 0) + 1
+        self._pump()
 
-    def close(self) -> None:
-        self._thread_pool.clear()
-        self._thread_pool.waitForDone(500)
-        self._lru_tile_cache.clear()
-        self._active_requests.clear()
-        self._provider.shutdown()
+    def _pump(self) -> None:
+        """Starts wanted tiles, nearest-first, never exceeding the in-flight cap."""
+        while (
+            self._wanted
+            and len(self._in_flight) < self._max_in_flight
+            and not self._closed.is_set()
+        ):
+            key = self._wanted.popleft()
+            if key in self._in_flight or key in self._cache:
+                continue
+            if self._failures.get(key, 0) > TILE_FETCH_MAX_RETRIES:
+                continue
+            level, col, row = key
+            origin, size, _ = self.tile_geometry(level, col, row)
+            self._in_flight.add(key)
+            self._pool.start(
+                PyramidalTileFetchTask(
+                    self._handles, key, origin, size, self.signals, self._closed
+                )
+            )
+
+    # ---- painting -----------------------------------------------------------
+    def _owning_view(self, widget: QWidget | None) -> QGraphicsView | None:
+        scene = self.scene()
+        views = scene.views() if scene is not None else []
+        for view in views:
+            if widget is not None and view.viewport() is widget:
+                return view
+        return views[0] if views else None
 
     def paint(
         self,
@@ -1090,89 +1625,100 @@ class PyramidalSlideCanvas(QGraphicsItem):
         option: QStyleOptionGraphicsItem,
         widget: QWidget | None = None,
     ) -> None:
-        visible_area = option.exposedRect.intersected(self.boundingRect())
-        if visible_area.isEmpty():
+        bounds = self.boundingRect()
+        exposed = option.exposedRect.intersected(bounds)
+        if exposed.isEmpty() or self._closed.is_set():
+            return
+        painter.save()
+        painter.setClipRect(bounds, Qt.ClipOperation.IntersectClip)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self._paint_overview(painter, exposed)
+        self._paint_tiles(painter, exposed, widget)
+        painter.restore()
+
+    def _paint_overview(self, painter: QPainter, exposed: QRectF) -> None:
+        scale_x = self._overview.width() / float(self._width)
+        scale_y = self._overview.height() / float(self._height)
+        source = QRectF(
+            exposed.left() * scale_x,
+            exposed.top() * scale_y,
+            exposed.width() * scale_x,
+            exposed.height() * scale_y,
+        )
+        painter.drawPixmap(exposed, self._overview, source)
+
+    def _paint_tiles(
+        self, painter: QPainter, exposed: QRectF, widget: QWidget | None
+    ) -> None:
+        view = self._owning_view(widget)
+        dpr = view.devicePixelRatioF() if view is not None else 1.0
+        zoom = QStyleOptionGraphicsItem.levelOfDetailFromTransform(
+            painter.worldTransform()
+        )
+        if zoom <= 0.0:
+            return
+        screen_ds = 1.0 / (zoom * dpr)
+        if screen_ds >= self._overview_ds:
+            self._wanted.clear()  # the overview already has enough resolution
             return
 
-        # Paint scaled overview thumbnail without pre-allocating an enormous gigapixel pixmap
-        src_w = float(self._overview_pixmap.width())
-        src_h = float(self._overview_pixmap.height())
-        scale_x = src_w / float(self._dimensions[0])
-        scale_y = src_h / float(self._dimensions[1])
-
-        thumb_src_rect = QRectF(
-            visible_area.left() * scale_x,
-            visible_area.top() * scale_y,
-            visible_area.width() * scale_x,
-            visible_area.height() * scale_y,
-        )
-        painter.drawPixmap(visible_area, self._overview_pixmap, thumb_src_rect)
-
-        scale_factor = painter.worldTransform().m11()
-        if scale_factor < 0.08:
-            return
-
-        inverse_zoom = 1.0 / scale_factor
-        pyramid_level = 0
-        for lvl_idx, ds in enumerate(self._downsamples):
-            if ds <= inverse_zoom:
-                pyramid_level = lvl_idx
-            else:
-                break
-
-        level_ds = self._downsamples[pyramid_level]
-        start_x = (
-            math.floor(visible_area.left() / PYRAMIDAL_TILE_EDGE_PX)
-            * PYRAMIDAL_TILE_EDGE_PX
-        )
-        end_x = (
-            math.ceil(visible_area.right() / PYRAMIDAL_TILE_EDGE_PX)
-            * PYRAMIDAL_TILE_EDGE_PX
-        )
-        start_y = (
-            math.floor(visible_area.top() / PYRAMIDAL_TILE_EDGE_PX)
-            * PYRAMIDAL_TILE_EDGE_PX
-        )
-        end_y = (
-            math.ceil(visible_area.bottom() / PYRAMIDAL_TILE_EDGE_PX)
-            * PYRAMIDAL_TILE_EDGE_PX
+        level = select_pyramid_level(self._downsamples, screen_ds)
+        ds = self._downsamples[level]
+        painter.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform, zoom * dpr * ds < 1.0
         )
 
-        for tx in range(start_x, end_x, PYRAMIDAL_TILE_EDGE_PX):
-            for ty in range(start_y, end_y, PYRAMIDAL_TILE_EDGE_PX):
-                edge_w = min(PYRAMIDAL_TILE_EDGE_PX, self._dimensions[0] - tx)
-                edge_h = min(PYRAMIDAL_TILE_EDGE_PX, self._dimensions[1] - ty)
-                if edge_w <= 0 or edge_h <= 0:
+        # Fetch for the whole viewport, not just the (possibly partial) exposed rect.
+        if view is not None:
+            view_rect = view.mapToScene(view.viewport().rect()).boundingRect()
+            view_rect = view_rect.intersected(self.boundingRect())
+        else:
+            view_rect = exposed
+        centre = view_rect.center()
+
+        missing: list[tuple[float, TileKey]] = []
+        for col, row in self.tiles_for_rect(level, view_rect):
+            key = (level, col, row)
+            _, _, target = self.tile_geometry(level, col, row)
+            image = self._cache.get(key)
+            if image is not None:
+                self._hits += 1
+                self._cache.move_to_end(key)
+                if target.intersects(exposed):
+                    painter.drawImage(target, image)
+                continue
+            self._misses += 1
+            delta = target.center() - centre
+            missing.append((delta.x() ** 2 + delta.y() ** 2, key))
+            if target.intersects(exposed):
+                self._paint_coarse_fallback(painter, level, target)
+
+        missing.sort(key=lambda item: item[0])
+        self._wanted = deque(key for _, key in missing)
+        self._pump()
+
+    def _paint_coarse_fallback(
+        self, painter: QPainter, level: int, target: QRectF
+    ) -> None:
+        """Shows already-cached coarser tiles while the sharp tile is loading."""
+        last_level = len(self._downsamples) - 1
+        for coarse in range(min(level + 2, last_level), level, -1):
+            coarse_ds = self._downsamples[coarse]
+            for col, row in self.tiles_for_rect(coarse, target):
+                image = self._cache.get((coarse, col, row))
+                if image is None:
                     continue
-
-                tile_key = (pyramid_level, tx, ty)
-                cached_tile = self._lru_tile_cache.get(tile_key)
-
-                if cached_tile is not None:
-                    self._lru_tile_cache.move_to_end(tile_key)
-                    painter.drawPixmap(
-                        QRectF(tx, ty, edge_w, edge_h),
-                        cached_tile,
-                        QRectF(0, 0, cached_tile.width(), cached_tile.height()),
-                    )
-                else:
-                    if (
-                        tile_key not in self._active_requests
-                        and len(self._active_requests) < 32
-                    ):
-                        self._active_requests.add(tile_key)
-                        task = PyramidalTileFetchTask(
-                            self._provider,
-                            pyramid_level,
-                            tx,
-                            ty,
-                            edge_w,
-                            edge_h,
-                            round(edge_w / level_ds),
-                            round(edge_h / level_ds),
-                            self.signals,
-                        )
-                        self._thread_pool.start(task)
+                coarse_rect = self.tile_geometry(coarse, col, row)[2]
+                overlap = coarse_rect.intersected(target)
+                if overlap.isEmpty():
+                    continue
+                source = QRectF(
+                    (overlap.left() - coarse_rect.left()) / coarse_ds,
+                    (overlap.top() - coarse_rect.top()) / coarse_ds,
+                    overlap.width() / coarse_ds,
+                    overlap.height() / coarse_ds,
+                )
+                painter.drawImage(overlap, image, source)
 
 
 # ==============================================================================
@@ -1185,11 +1731,14 @@ class FastVectorOverlay(QGraphicsItem):
         self, color_hex: str, z_index: float, parent: QGraphicsItem | None = None
     ):
         super().__init__(parent)
+        # Needed so Qt reports only the exposed part of the item, not all of it.
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption, True)
         self.setZValue(z_index)
         self._pen = QPen(QColor(color_hex), 2)
         self._pen.setCosmetic(True)
 
         self._boxes = np.empty((0, 4), dtype=np.float32)
+        self._rects: list[QRectF] = []
         self._polygons: list[QPolygonF] = []
         self._bounds = QRectF()
 
@@ -1207,6 +1756,7 @@ class FastVectorOverlay(QGraphicsItem):
 
         if boxes:
             self._boxes = np.array(boxes, dtype=np.float32)
+            self._rects = [QRectF(x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in boxes]
             min_x = float(np.min(self._boxes[:, 0]))
             min_y = float(np.min(self._boxes[:, 1]))
             max_x = float(np.max(self._boxes[:, 2]))
@@ -1214,6 +1764,7 @@ class FastVectorOverlay(QGraphicsItem):
             unified_rect = QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
         else:
             self._boxes = np.empty((0, 4), dtype=np.float32)
+            self._rects = []
 
         for poly in self._polygons:
             poly_rect = poly.boundingRect()
@@ -1227,6 +1778,7 @@ class FastVectorOverlay(QGraphicsItem):
     def clear(self) -> None:
         self.prepareGeometryChange()
         self._boxes = np.empty((0, 4), dtype=np.float32)
+        self._rects = []
         self._polygons.clear()
         self._bounds = QRectF()
         self.update()
@@ -1250,10 +1802,15 @@ class FastVectorOverlay(QGraphicsItem):
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
         if self._boxes.size > 0:
-            left = exposed.left()
-            top = exposed.top()
-            right = exposed.right()
-            bottom = exposed.bottom()
+            # Pad by the cosmetic pen width so edge strokes are not clipped.
+            zoom = QStyleOptionGraphicsItem.levelOfDetailFromTransform(
+                painter.worldTransform()
+            )
+            pad = 3.0 / zoom if zoom > 0 else 0.0
+            left = exposed.left() - pad
+            top = exposed.top() - pad
+            right = exposed.right() + pad
+            bottom = exposed.bottom() + pad
 
             visible_mask = (
                 (self._boxes[:, 0] <= right)
@@ -1261,14 +1818,12 @@ class FastVectorOverlay(QGraphicsItem):
                 & (self._boxes[:, 1] <= bottom)
                 & (self._boxes[:, 3] >= top)
             )
-            visible_boxes = self._boxes[visible_mask]
-
-            if visible_boxes.size > 0:
-                rectangles = [
-                    QRectF(row[0], row[1], row[2] - row[0], row[3] - row[1])
-                    for row in visible_boxes
-                ]
-                painter.drawRects(rectangles)
+            if visible_mask.all():
+                painter.drawRects(self._rects)
+            elif visible_mask.any():
+                painter.drawRects(
+                    [self._rects[i] for i in np.flatnonzero(visible_mask)]
+                )
 
         for poly in self._polygons:
             if exposed.intersects(poly.boundingRect()):
@@ -1328,32 +1883,135 @@ class DiagnosticHotspotOverlay(QGraphicsItem):
 
 
 # ==============================================================================
-# SECTION 5: ONNX DETECTOR & ASYNC INFERENCE WORKER
+# SECTION 5: ONNX DETECTOR, MODEL MANAGER & ASYNC INFERENCE WORKER
 # ==============================================================================
-_PROVIDER_PREFERENCE = (
+_CPU_PROVIDER = "CPUExecutionProvider"
+_ACCELERATOR_PREFERENCE = (
     "CUDAExecutionProvider",
     "ROCMExecutionProvider",
     "DmlExecutionProvider",
-    "CPUExecutionProvider",
 )
 _PROVIDER_LABELS = {
     "CUDAExecutionProvider": "GPU · CUDA",
     "ROCMExecutionProvider": "GPU · ROCm",
     "DmlExecutionProvider": "GPU · DirectML",
-    "CPUExecutionProvider": "CPU",
+    _CPU_PROVIDER: "CPU",
 }
-_ONNX_INPUT_DTYPES = {"tensor(float)": np.float32, "tensor(float16)": np.float16}
+_PROVIDER_SHARED_LIBS = {
+    "CUDAExecutionProvider": "onnxruntime_providers_cuda",
+    "ROCMExecutionProvider": "onnxruntime_providers_rocm",
+}
+_ONNX_FLOAT_DTYPES = {"tensor(float)": np.float32, "tensor(float16)": np.float16}
 
-
-def select_execution_providers() -> list[str]:
-    """Orders the installed ONNX Runtime providers: GPU backends first, CPU last."""
-    available = set(ort.get_available_providers())
-    chosen = [p for p in _PROVIDER_PREFERENCE if p in available]
-    return chosen or ["CPUExecutionProvider"]
+_provider_state_lock = threading.Lock()
+_provider_failures: dict[str, str] = {}
+_runtime_dlls_preloaded = False
 
 
 def describe_provider(provider: str) -> str:
     return _PROVIDER_LABELS.get(provider, provider)
+
+
+def _provider_library_path(provider: str) -> Path | None:
+    stem = _PROVIDER_SHARED_LIBS.get(provider)
+    if stem is None:
+        return None
+    if sys.platform == "win32":
+        name = f"{stem}.dll"
+    elif sys.platform == "darwin":
+        name = f"lib{stem}.dylib"
+    else:
+        name = f"lib{stem}.so"
+    path = Path(ort.__file__).resolve().parent / "capi" / name
+    return path if path.is_file() else None
+
+
+def probe_provider_library(provider: str) -> str | None:
+    """Loads the provider's shared library and returns the loader error, if any.
+
+    ONNX Runtime lists CUDA as 'available' whenever the provider library ships
+    with the wheel, even if its CUDA/cuDNN dependencies are missing. Loading the
+    library surfaces the real missing dependency (e.g. libcublasLt.so.12).
+    """
+    library = _provider_library_path(provider)
+    if library is None:
+        return None
+    try:
+        ctypes.CDLL(str(library))
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _preload_runtime_dlls() -> None:
+    """Lets ONNX Runtime (>=1.21) find CUDA/cuDNN pip wheels; best effort."""
+    global _runtime_dlls_preloaded
+    if _runtime_dlls_preloaded:
+        return
+    _runtime_dlls_preloaded = True
+    preload = getattr(ort, "preload_dlls", None)
+    if preload is None:
+        return
+    try:
+        preload()
+    except Exception:  # optional helper; any failure is non-fatal
+        logger.debug("onnxruntime.preload_dlls() failed", exc_info=True)
+
+
+def _record_provider_failure(provider: str, reason: str) -> None:
+    with _provider_state_lock:
+        _provider_failures[provider] = reason
+
+
+def usable_accelerator() -> str | None:
+    """First accelerator that is installed, not known-broken and loadable."""
+    available = set(ort.get_available_providers())
+    for provider in _ACCELERATOR_PREFERENCE:
+        if provider not in available:
+            continue
+        with _provider_state_lock:
+            if provider in _provider_failures:
+                continue
+        if provider == "CUDAExecutionProvider":
+            _preload_runtime_dlls()
+        error = probe_provider_library(provider)
+        if error is not None:
+            _record_provider_failure(provider, error)
+            logger.warning("%s cannot be loaded: %s", provider, error)
+            continue
+        return provider
+    return None
+
+
+def provider_failure_reason(provider: str) -> str | None:
+    with _provider_state_lock:
+        return _provider_failures.get(provider)
+
+
+def build_accelerator_diagnostic(provider: str, reason: str) -> str:
+    runtime = "CUDA and cuDNN" if provider.startswith("CUDA") else "GPU runtime"
+    return (
+        f"{describe_provider(provider)} is not usable: {reason}. Running on CPU. "
+        f"To enable it, install the {runtime} libraries that match this "
+        "onnxruntime-gpu build (see the ONNX Runtime execution-provider "
+        "requirements) and make them visible to the dynamic loader; this cannot "
+        "be fixed from application code."
+    )
+
+
+@dataclass(frozen=True)
+class ProviderReport:
+    """Which provider actually runs the model, and why a GPU was not used."""
+
+    active: str
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _ModelContract:
+    input_name: str
+    input_dtype: type
+    static_batch: int | None
 
 
 class OnnxEosinophilDetector:
@@ -1375,32 +2033,87 @@ class OnnxEosinophilDetector:
         if not path.is_file():
             raise FileNotFoundError(f"ONNX model not found: {path}")
 
-        providers = select_execution_providers()
+        self._session, self._contract, self.provider_report = self._open(path)
+        self._conf = conf_threshold
+
+    # ---- session creation ---------------------------------------------------
+    @classmethod
+    def _open(
+        cls, path: Path
+    ) -> tuple[ort.InferenceSession, _ModelContract, ProviderReport]:
+        accelerator = usable_accelerator()
+        gpu_error: str | None = None
+        if accelerator is not None:
+            try:
+                session, contract = cls._create_validated(
+                    path, [accelerator, _CPU_PROVIDER]
+                )
+                active = session.get_providers()
+                if not active or active[0] != accelerator:
+                    raise RuntimeError(
+                        f"{accelerator} was requested but ONNX Runtime registered "
+                        f"{active}"
+                    )
+                logger.info("ONNX Runtime provider: %s", describe_provider(active[0]))
+                return session, contract, ProviderReport(active[0])
+            except (RuntimeError, ValueError, OSError) as exc:
+                gpu_error = str(exc)
+                logger.warning("%s initialisation failed: %s", accelerator, exc)
+
+        # A genuine model error re-raises here and is reported as such.
+        session, contract = cls._create_validated(path, [_CPU_PROVIDER])
+        reason = None
+        if accelerator is not None and gpu_error is not None:
+            _record_provider_failure(accelerator, gpu_error)
+            reason = build_accelerator_diagnostic(accelerator, gpu_error)
+        else:
+            for provider in _ACCELERATOR_PREFERENCE:
+                known = provider_failure_reason(provider)
+                if known is not None and provider in ort.get_available_providers():
+                    reason = build_accelerator_diagnostic(provider, known)
+                    break
+        if reason is not None:
+            logger.warning(reason)
+        logger.info("ONNX Runtime provider: CPU")
+        return session, contract, ProviderReport(_CPU_PROVIDER, reason)
+
+    @classmethod
+    def _create_validated(
+        cls, path: Path, providers: list[str]
+    ) -> tuple[ort.InferenceSession, _ModelContract]:
         options = ort.SessionOptions()
-        options.log_severity_level = 3
         if "DmlExecutionProvider" in providers:
             options.enable_mem_pattern = False  # required by the DirectML provider
-        self._session = ort.InferenceSession(
+        session = ort.InferenceSession(
             str(path), sess_options=options, providers=providers
         )
+        contract = cls._validate_contract(session)
+        cls._smoke_test(session, contract)
+        return session, contract
 
-        outputs = self._session.get_outputs()
+    @staticmethod
+    def _validate_contract(session: ort.InferenceSession) -> _ModelContract:
+        inputs = session.get_inputs()
+        outputs = session.get_outputs()
+        if len(inputs) != 1:
+            raise ValueError(f"Expected a single-input detector, found {len(inputs)}.")
         if len(outputs) != 1:
             raise ValueError(
                 f"Expected a single-output detection model, found {len(outputs)} "
                 "outputs (segmentation models are not supported)."
             )
-
-        model_input = self._session.get_inputs()[0]
-        if model_input.type not in _ONNX_INPUT_DTYPES:
+        model_input = inputs[0]
+        if model_input.type not in _ONNX_FLOAT_DTYPES:
             raise ValueError(f"Unsupported ONNX input type: {model_input.type}")
-        self._input_name = model_input.name
-        self._input_dtype = _ONNX_INPUT_DTYPES[model_input.type]
-        batch_dim, _, height_dim, width_dim = model_input.shape
-        # Exports are static-batch unless made with dynamic=True.
-        self._static_batch: int | None = (
-            batch_dim if isinstance(batch_dim, int) else None
-        )
+        if outputs[0].type not in _ONNX_FLOAT_DTYPES:
+            raise ValueError(f"Unsupported ONNX output type: {outputs[0].type}")
+        if len(model_input.shape) != 4:
+            raise ValueError(
+                f"Expected a 4-D NCHW input, got shape {model_input.shape}."
+            )
+        batch_dim, channel_dim, height_dim, width_dim = model_input.shape
+        if isinstance(channel_dim, int) and channel_dim != 3:
+            raise ValueError(f"Model expects {channel_dim} channels, tiles are RGB.")
         for dim in (height_dim, width_dim):
             if isinstance(dim, int) and dim != PATCH_PIXEL_DIMENSION:
                 raise ValueError(
@@ -1408,20 +2121,41 @@ class OnnxEosinophilDetector:
                     f"{PATCH_PIXEL_DIMENSION}x{PATCH_PIXEL_DIMENSION}; re-export with "
                     f"imgsz={PATCH_PIXEL_DIMENSION}."
                 )
-        self._conf = conf_threshold
+        return _ModelContract(
+            input_name=model_input.name,
+            input_dtype=_ONNX_FLOAT_DTYPES[model_input.type],
+            # Exports are static-batch unless made with dynamic=True.
+            static_batch=batch_dim if isinstance(batch_dim, int) else None,
+        )
 
+    @staticmethod
+    def _smoke_test(session: ort.InferenceSession, contract: _ModelContract) -> None:
+        """One zero-tensor run: initialises kernels and checks the output layout."""
+        batch = contract.static_batch or 1
+        dummy = np.zeros(
+            (batch, 3, PATCH_PIXEL_DIMENSION, PATCH_PIXEL_DIMENSION),
+            dtype=contract.input_dtype,
+        )
+        out = np.asarray(session.run(None, {contract.input_name: dummy})[0])
+        if out.ndim != 3 or out.shape[0] != batch or min(out.shape[1:]) < 5:
+            raise ValueError(
+                f"Unsupported detector output shape {tuple(out.shape)}; expected "
+                "(B, 4+nc, N) or (B, N, 6)."
+            )
+
+    # ---- inference ----------------------------------------------------------
     @property
     def active_provider(self) -> str:
-        return self._session.get_providers()[0]
+        return self.provider_report.active
 
     def effective_batch_size(self, requested: int) -> int:
-        return self._static_batch or requested
+        return self._contract.static_batch or requested
 
     def predict(
         self, tiles_rgb: list[np.ndarray]
     ) -> list[tuple[np.ndarray, np.ndarray]]:
         """Runs HxWx3 uint8 RGB tiles; returns (xyxy boxes, scores) per tile."""
-        step = self._static_batch or len(tiles_rgb)
+        step = self._contract.static_batch or len(tiles_rgb)
         results: list[tuple[np.ndarray, np.ndarray]] = []
         for start in range(0, len(tiles_rgb), step):
             results.extend(self._run_batch(tiles_rgb[start : start + step]))
@@ -1430,18 +2164,25 @@ class OnnxEosinophilDetector:
     def _run_batch(
         self, tiles_rgb: list[np.ndarray]
     ) -> list[tuple[np.ndarray, np.ndarray]]:
-        batch = np.stack(tiles_rgb).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
-        batch = np.ascontiguousarray(batch, dtype=self._input_dtype)
+        count = len(tiles_rgb)
+        static = self._contract.static_batch
+        # Static-batch exports need a full batch; zero rows pad it and are dropped.
+        rows = static if static is not None and count < static else count
+        batch = np.zeros(
+            (rows, 3, PATCH_PIXEL_DIMENSION, PATCH_PIXEL_DIMENSION), dtype=np.float32
+        )
+        for index, tile in enumerate(tiles_rgb):
+            np.divide(
+                tile.transpose(2, 0, 1),
+                np.float32(255.0),
+                out=batch[index],
+                dtype=np.float32,
+            )
+        if self._contract.input_dtype != np.float32:
+            batch = batch.astype(self._contract.input_dtype)
 
-        # Static-batch exports need a full batch; pad and drop the extra outputs.
-        pad = 0
-        if self._static_batch is not None and len(batch) < self._static_batch:
-            pad = self._static_batch - len(batch)
-            filler = np.zeros((pad, *batch.shape[1:]), dtype=batch.dtype)
-            batch = np.concatenate([batch, filler])
-
-        raw = self._session.run(None, {self._input_name: batch})[0]
-        raw = np.asarray(raw, dtype=np.float32)[: len(raw) - pad]
+        raw = self._session.run(None, {self._contract.input_name: batch})[0]
+        raw = np.asarray(raw, dtype=np.float32)[:count]
         return [self._decode(sample) for sample in raw]
 
     def _decode(self, pred: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1463,6 +2204,224 @@ class OnnxEosinophilDetector:
         return np.clip(boxes, 0.0, limit), scores
 
 
+# ------------------------------------------------------------------------------
+# Model lifecycle: one background-initialised detector, reused across runs.
+# ------------------------------------------------------------------------------
+@dataclass
+class ModelEntry:
+    """A (possibly still loading) detector; `ready` is set when it finishes."""
+
+    key: tuple[str, int | None, int | None]
+    ready: threading.Event = field(default_factory=threading.Event)
+    detector: OnnxEosinophilDetector | None = None
+    error: str | None = None
+
+
+class _ModelLoadTask(QRunnable):
+    def __init__(self, manager: ModelManager, entry: ModelEntry, path: str) -> None:
+        super().__init__()
+        self._manager = manager
+        self._entry = entry
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            self._entry.detector = OnnxEosinophilDetector(
+                self._path, BASE_TENSOR_EXTRACTION_CONFIDENCE
+            )
+        except (ValueError, OSError, RuntimeError) as exc:
+            logger.exception("Model initialisation failed")
+            self._entry.error = str(exc) or type(exc).__name__
+        except Exception as exc:  # last resort: waiters must always be released
+            logger.exception("Unexpected model initialisation failure")
+            self._entry.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._entry.ready.set()
+            self._manager.publish(self._entry)
+
+
+class ModelManager(QObject):
+    """Loads the detector once in the background and reuses it while unchanged.
+
+    The cache key is (resolved path, mtime, size), so replacing the file on disk
+    triggers one reload while an unchanged model is never re-initialised. A failed
+    load for an unchanged key is cached too (no repeated failing attempts).
+    """
+
+    # state: loading | ready | warning | error, short label, tooltip/log detail
+    state_changed = Signal(str, str, str)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._entry: ModelEntry | None = None
+        self._pool = QThreadPool()
+        self._pool.setMaxThreadCount(1)
+
+    @staticmethod
+    def _make_key(model_path: str) -> tuple[str, int | None, int | None]:
+        path = Path(model_path).expanduser()
+        try:
+            resolved = path.resolve()
+            stat = resolved.stat()
+        except OSError:
+            return (str(path.absolute()), None, None)
+        return (str(resolved), stat.st_mtime_ns, stat.st_size)
+
+    def request(self, model_path: str) -> ModelEntry:
+        key = self._make_key(model_path)
+        with self._lock:
+            if self._entry is not None and self._entry.key == key:
+                return self._entry
+            entry = ModelEntry(key)
+            self._entry = entry
+        self.state_changed.emit(
+            "loading", "Model: loading…", f"Loading {Path(model_path).name}"
+        )
+        self._pool.start(_ModelLoadTask(self, entry, model_path))
+        return entry
+
+    def publish(self, entry: ModelEntry) -> None:
+        """Called from the loader thread; ignores superseded entries."""
+        with self._lock:
+            if self._entry is not entry:
+                return
+        name = Path(entry.key[0]).name
+        if entry.error is not None:
+            self.state_changed.emit("error", "Model: error", entry.error)
+            return
+        report = entry.detector.provider_report  # type: ignore[union-attr]
+        if report.fallback_reason:
+            self.state_changed.emit(
+                "warning",
+                f"{describe_provider(report.active)} (GPU unavailable)",
+                report.fallback_reason,
+            )
+        else:
+            self.state_changed.emit(
+                "ready",
+                describe_provider(report.active),
+                f"{name} on {describe_provider(report.active)}",
+            )
+
+    def shutdown(self, timeout_ms: int = 5000) -> None:
+        self._pool.waitForDone(timeout_ms)
+        with self._lock:
+            self._entry = None
+
+
+# ------------------------------------------------------------------------------
+# Tiled inference
+# ------------------------------------------------------------------------------
+def patch_geometry(
+    spec: SlideSpecification, overlap_ratio: float
+) -> tuple[int, int, int, int]:
+    """(patch_w, patch_h, stride_x, stride_y) in level-0 pixels (MPP-normalised)."""
+    patch_w = max(1, round(PATCH_PIXEL_DIMENSION * (TARGET_MODEL_MPP / spec.mpp_x)))
+    patch_h = max(1, round(PATCH_PIXEL_DIMENSION * (TARGET_MODEL_MPP / spec.mpp_y)))
+    stride_x = max(1, round(patch_w * (1.0 - overlap_ratio)))
+    stride_y = max(1, round(patch_h * (1.0 - overlap_ratio)))
+    return patch_w, patch_h, stride_x, stride_y
+
+
+def plan_tissue_patches(
+    full_w: int,
+    full_h: int,
+    geometry: tuple[int, int, int, int],
+    tissue_mask: np.ndarray,
+    min_coverage: float,
+) -> list[tuple[int, int, int, int]]:
+    """Sliding-window patches (x, y, w, h) whose tissue coverage passes the floor."""
+    patch_w, patch_h, stride_x, stride_y = geometry
+    mask_h, mask_w = tissue_mask.shape
+    scale_x = mask_w / float(full_w)
+    scale_y = mask_h / float(full_h)
+
+    patches: list[tuple[int, int, int, int]] = []
+    for py in range(0, full_h, stride_y):
+        for px in range(0, full_w, stride_x):
+            pw = min(patch_w, full_w - px)
+            ph = min(patch_h, full_h - py)
+            if pw < patch_w // 2 or ph < patch_h // 2:
+                continue
+
+            mx1 = int(px * scale_x)
+            my1 = int(py * scale_y)
+            mx2 = max(mx1 + 1, int((px + pw) * scale_x))
+            my2 = max(my1 + 1, int((py + ph) * scale_y))
+
+            region = tissue_mask[my1:my2, mx1:mx2]
+            if region.size > 0:
+                coverage = np.count_nonzero(region) / float(region.size)
+                if coverage >= min_coverage:
+                    patches.append((px, py, pw, ph))
+    return patches
+
+
+def read_model_tile(
+    handles: SlideHandlePool,
+    px: int,
+    py: int,
+    pw: int,
+    ph: int,
+    patch_w: int,
+    patch_h: int,
+) -> tuple[np.ndarray, int, int]:
+    """Reads a level-0 patch as a 640x640 uint8 RGB model tile.
+
+    Full patches are resized to 640x640 exactly as before. Partial edge patches
+    (pw < patch_w or ph < patch_h) are resized with the *same* scale as full
+    patches and padded at the bottom/right with PATCH_PAD_VALUE, so the model
+    never sees a stretched image. Returns (tile, content_w, content_h), where the
+    content size is the unpadded area in tile pixels.
+    """
+    with handles.borrow() as slide:
+        tile_rgba = slide.read_region((px, py), 0, (pw, ph))
+    tile_rgb = tile_rgba.convert("RGB")
+    tile_rgba.close()
+    size = PATCH_PIXEL_DIMENSION
+    content_w = min(size, max(1, round(pw * size / patch_w)))
+    content_h = min(size, max(1, round(ph * size / patch_h)))
+    if pw == patch_w and ph == patch_h:
+        content_w = content_h = size
+    if (content_w, content_h) != tile_rgb.size:
+        resized = tile_rgb.resize((content_w, content_h), Image.Resampling.BILINEAR)
+        tile_rgb.close()
+        tile_rgb = resized
+    content = np.asarray(tile_rgb)
+    tile_rgb.close()
+    if content_w == size and content_h == size:
+        return content, content_w, content_h
+    padded = np.full((size, size, 3), PATCH_PAD_VALUE, dtype=np.uint8)
+    padded[:content_h, :content_w] = content
+    return padded, content_w, content_h
+
+
+def crop_to_content(
+    boxes: np.ndarray, scores: np.ndarray, content_w: int, content_h: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drops boxes centred in the padding and clips the rest to the real image."""
+    if content_w >= PATCH_PIXEL_DIMENSION and content_h >= PATCH_PIXEL_DIMENSION:
+        return boxes, scores
+    centre_x = (boxes[:, 0] + boxes[:, 2]) / 2.0
+    centre_y = (boxes[:, 1] + boxes[:, 3]) / 2.0
+    keep = (centre_x < content_w) & (centre_y < content_h)
+    boxes, scores = boxes[keep].copy(), scores[keep]
+    boxes[:, 0::2] = np.minimum(boxes[:, 0::2], content_w)
+    boxes[:, 1::2] = np.minimum(boxes[:, 1::2], content_h)
+    return boxes, scores
+
+
+def to_slide_coordinates(
+    boxes: np.ndarray, origin_x: int, origin_y: int, scale_x: float, scale_y: float
+) -> np.ndarray:
+    """Maps patch-pixel xyxy boxes to level-0 slide pixels (float64 maths)."""
+    mapped = boxes.astype(np.float64)
+    mapped[:, 0::2] = origin_x + mapped[:, 0::2] * scale_x
+    mapped[:, 1::2] = origin_y + mapped[:, 1::2] * scale_y
+    return mapped
+
+
 class EsophaInferenceWorker(QObject):
     """Asynchronous worker for patched sliding-window inference and cell extraction."""
 
@@ -1479,133 +2438,135 @@ class EsophaInferenceWorker(QObject):
         config: EsophaScopeConfig,
         spec: SlideSpecification,
         tissue_mask: np.ndarray,
+        model_entry: ModelEntry,
     ):
         super().__init__()
         self._slide_path = slide_path
         self._config = config
         self._spec = spec
         self._tissue_mask = tissue_mask
+        self._model_entry = model_entry
         self._cancel_signal = threading.Event()
 
     def cancel(self) -> None:
         self._cancel_signal.set()
 
+    def _await_model(self) -> OnnxEosinophilDetector | None:
+        entry = self._model_entry
+        if not entry.ready.is_set():
+            self.status_updated.emit("Waiting for the model to finish loading...")
+        while not entry.ready.wait(MODEL_LOAD_POLL_SECONDS):
+            if self._cancel_signal.is_set():
+                return None
+        if entry.error is not None or entry.detector is None:
+            raise RuntimeError(entry.error or "Model failed to initialise.")
+        return entry.detector
+
     def run(self) -> None:
-        slide_handle = None
+        executor: ThreadPoolExecutor | None = None
+        handles: SlideHandlePool | None = None
         try:
-            self.status_updated.emit("Loading ONNX model...")
-            detector = OnnxEosinophilDetector(
-                self._config.model_weights_path, BASE_TENSOR_EXTRACTION_CONFIDENCE
-            )
+            detector = self._await_model()
+            if detector is None:
+                self.inference_cancelled.emit()
+                return
             batch_size = detector.effective_batch_size(self._config.batch_size)
             self.status_updated.emit(
                 f"Model ready on {describe_provider(detector.active_provider)}."
             )
 
-            slide_handle = openslide.OpenSlide(self._slide_path)
-            full_w, full_h = self._spec.width_px, self._spec.height_px
-
-            patch_w_px = round(
-                PATCH_PIXEL_DIMENSION * (TARGET_MODEL_MPP / self._spec.mpp_x)
+            spec = self._spec
+            geometry = patch_geometry(spec, self._config.patch_overlap_ratio)
+            patch_w, patch_h = geometry[0], geometry[1]
+            patches = plan_tissue_patches(
+                spec.width_px,
+                spec.height_px,
+                geometry,
+                self._tissue_mask,
+                self._config.tissue_min_coverage,
             )
-            patch_h_px = round(
-                PATCH_PIXEL_DIMENSION * (TARGET_MODEL_MPP / self._spec.mpp_y)
+            total = len(patches)
+            self.status_updated.emit(f"Evaluating {total:,} tissue patches...")
+            self.progress_updated.emit(0, total, 0)
+
+            readers = patch_reader_count()
+            handles = SlideHandlePool(self._slide_path, readers)
+            executor = ThreadPoolExecutor(
+                max_workers=readers, thread_name_prefix="esopha-read"
             )
-            stride_x = round(patch_w_px * (1.0 - self._config.patch_overlap_ratio))
-            stride_y = round(patch_h_px * (1.0 - self._config.patch_overlap_ratio))
+            lookahead = max(2 * batch_size, 2 * readers)
+            pending: deque[Future[tuple[np.ndarray, int, int]]] = deque()
+            submitted = 0
 
-            mask_h, mask_w = self._tissue_mask.shape
-            scale_x = mask_w / float(full_w)
-            scale_y = mask_h / float(full_h)
-
-            scheduled_patches: list[tuple[int, int, int, int]] = []
-            for py in range(0, full_h, stride_y):
-                for px in range(0, full_w, stride_x):
-                    pw = min(patch_w_px, full_w - px)
-                    ph = min(patch_h_px, full_h - py)
-                    if pw < patch_w_px // 2 or ph < patch_h_px // 2:
-                        continue
-
-                    mx1 = int(px * scale_x)
-                    my1 = int(py * scale_y)
-                    mx2 = max(mx1 + 1, int((px + pw) * scale_x))
-                    my2 = max(my1 + 1, int((py + ph) * scale_y))
-
-                    patch_region = self._tissue_mask[my1:my2, mx1:mx2]
-                    if patch_region.size > 0:
-                        coverage = np.count_nonzero(patch_region) / float(
-                            patch_region.size
-                        )
-                        if coverage >= self._config.tissue_min_coverage:
-                            scheduled_patches.append((px, py, pw, ph))
-
-            total_patches = len(scheduled_patches)
-            self.status_updated.emit(f"Evaluating {total_patches:,} tissue patches...")
-            self.progress_updated.emit(0, total_patches, 0)
-
-            collected_boxes: list[list[float]] = []
-            collected_scores: list[float] = []
+            box_chunks: list[np.ndarray] = []
+            score_chunks: list[np.ndarray] = []
+            detection_count = 0
             batch_tiles: list[np.ndarray] = []
-            batch_metadata: list[tuple[int, int, int, int]] = []
+            batch_meta: list[
+                tuple[int, int, int, int]
+            ] = []  # x, y, content_w, content_h
 
-            for idx, (px, py, pw, ph) in enumerate(scheduled_patches):
+            for idx in range(total):
+                # Keep the read-ahead window full; results are consumed in order.
+                while submitted < total and len(pending) < lookahead:
+                    px, py, pw, ph = patches[submitted]
+                    pending.append(
+                        executor.submit(
+                            read_model_tile, handles, px, py, pw, ph, patch_w, patch_h
+                        )
+                    )
+                    submitted += 1
+
                 if self._cancel_signal.is_set():
                     self.inference_cancelled.emit()
                     return
 
-                tile_rgba = slide_handle.read_region((px, py), 0, (pw, ph))
-                tile_rgb = tile_rgba.convert("RGB")
-                tile_rgba.close()
+                tile, content_w, content_h = pending.popleft().result()
+                batch_tiles.append(tile)
+                batch_meta.append(
+                    (patches[idx][0], patches[idx][1], content_w, content_h)
+                )
 
-                if pw != PATCH_PIXEL_DIMENSION or ph != PATCH_PIXEL_DIMENSION:
-                    tile_resized = tile_rgb.resize(
-                        (PATCH_PIXEL_DIMENSION, PATCH_PIXEL_DIMENSION),
-                        Image.Resampling.BILINEAR,
-                    )
-                    tile_rgb.close()
-                    tile_rgb = tile_resized
-
-                batch_tiles.append(np.asarray(tile_rgb))
-                tile_rgb.close()
-                batch_metadata.append((px, py, pw, ph))
-
-                if len(batch_tiles) == batch_size or idx == total_patches - 1:
+                if len(batch_tiles) == batch_size or idx == total - 1:
                     results = detector.predict(batch_tiles)
-
-                    for (cx, cy, cw, ch), (boxes_arr, scores_arr) in zip(
-                        batch_metadata, results, strict=True
+                    for (cx, cy, content_w, content_h), (boxes_arr, scores_arr) in zip(
+                        batch_meta, results, strict=True
                     ):
-                        sx = cw / float(PATCH_PIXEL_DIMENSION)
-                        sy = ch / float(PATCH_PIXEL_DIMENSION)
-                        for box, score in zip(boxes_arr, scores_arr, strict=True):
-                            collected_boxes.append(
-                                [
-                                    cx + box[0] * sx,
-                                    cy + box[1] * sy,
-                                    cx + box[2] * sx,
-                                    cy + box[3] * sy,
-                                ]
-                            )
-                            collected_scores.append(float(score))
+                        boxes_arr, scores_arr = crop_to_content(
+                            boxes_arr, scores_arr, content_w, content_h
+                        )
+                        if len(scores_arr) == 0:
+                            continue
+                        # Uniform scale: identical for full and partial patches.
+                        mapped = to_slide_coordinates(
+                            boxes_arr,
+                            cx,
+                            cy,
+                            patch_w / float(PATCH_PIXEL_DIMENSION),
+                            patch_h / float(PATCH_PIXEL_DIMENSION),
+                        )
+                        box_chunks.append(mapped.astype(np.float32))
+                        score_chunks.append(scores_arr.astype(np.float32))
+                        detection_count += len(scores_arr)
 
                     batch_tiles.clear()
-                    batch_metadata.clear()
-                    self.progress_updated.emit(
-                        idx + 1, total_patches, len(collected_boxes)
-                    )
+                    batch_meta.clear()
+                    self.progress_updated.emit(idx + 1, total, detection_count)
 
             self.status_updated.emit("Applying slide-level NMS merge...")
-            boxes_np = np.array(collected_boxes, dtype=np.float32)
-            scores_np = np.array(collected_scores, dtype=np.float32)
-            del collected_boxes, collected_scores
-            gc.collect()
+            if box_chunks:
+                boxes_np = np.concatenate(box_chunks)
+                scores_np = np.concatenate(score_chunks)
+            else:
+                boxes_np = np.empty((0, 4), dtype=np.float32)
+                scores_np = np.empty((0,), dtype=np.float32)
+            del box_chunks, score_chunks
 
-            retained_indices = non_max_suppression(
+            retained = non_max_suppression(
                 boxes_np, scores_np, self._config.nms_iou_threshold
             )
-
             cells: list[EosinophilCell] = []
-            for cell_id, k in enumerate(retained_indices, start=1):
+            for cell_id, k in enumerate(retained, start=1):
                 b = boxes_np[k]
                 cells.append(
                     EosinophilCell(
@@ -1619,13 +2580,9 @@ class EsophaInferenceWorker(QObject):
                         ),
                     )
                 )
+            del boxes_np, scores_np, retained
 
-            del boxes_np, scores_np, retained_indices
-            gc.collect()
-
-            hotspot = identify_peak_diagnostic_hpf(
-                cells, self._spec.mpp_x, self._spec.mpp_y
-            )
+            hotspot = identify_peak_diagnostic_hpf(cells, spec.mpp_x, spec.mpp_y)
             self.inference_finished.emit(cells, hotspot)
 
         except (
@@ -1634,13 +2591,18 @@ class EsophaInferenceWorker(QObject):
             OSError,
             openslide.OpenSlideError,
             TypeError,
+            MemoryError,
         ) as exc:
             logger.exception("EsophaScope inference error")
-            self.inference_failed.emit(str(exc))
+            self.inference_failed.emit(str(exc) or type(exc).__name__)
+        except Exception as exc:  # last resort: the GUI must never stay EXECUTING
+            logger.exception("Unexpected EsophaScope inference failure")
+            self.inference_failed.emit(f"{type(exc).__name__}: {exc}")
         finally:
-            if slide_handle:
-                slide_handle.close()
-            gc.collect()
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+            if handles is not None:
+                handles.shutdown()
             self.worker_finished.emit()
 
 
@@ -1649,6 +2611,7 @@ class EsophaInferenceWorker(QObject):
 # ==============================================================================
 class WorkbenchOperationalState(Enum):
     READY = "ready"
+    LOADING = "loading"
     EXECUTING = "executing"
     CANCELLING = "cancelling"
     COMPLETED = "completed"
@@ -1711,6 +2674,16 @@ class EsophaConfidenceFader(QFrame):
 
     def confidence(self) -> float:
         return self._slider.value() / 100.0
+
+
+def dropped_local_paths(mime_data) -> list[str]:
+    """Local files in a drag payload that are slides or annotation files."""
+    allowed = SLIDE_EXTENSIONS | ANNOTATION_EXTENSIONS
+    return [
+        url.toLocalFile()
+        for url in mime_data.urls()
+        if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in allowed
+    ]
 
 
 class EsophaViewport(QGraphicsView):
@@ -1779,20 +2752,26 @@ class EsophaViewport(QGraphicsView):
             pos_y = self.height() - ah - self.hpf_button_margin_bottom
             self._hud_hotspot_action.move(pos_x, pos_y)
 
+    # QGraphicsView's own drag handlers track scene drag state. This view takes
+    # over enter/move/drop for file drops, so it must also take over leave:
+    # the inherited dragLeaveEvent warns "drag leave received before drag enter".
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
+        if dropped_local_paths(event.mimeData()):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
-        if event.mimeData().hasUrls():
+        if dropped_local_paths(event.mimeData()):
             event.acceptProposedAction()
         else:
             event.ignore()
 
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        event.accept()
+
     def dropEvent(self, event: QDropEvent) -> None:
-        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        paths = dropped_local_paths(event.mimeData())
         if paths:
             self.files_dropped.emit(paths)
             event.acceptProposedAction()
@@ -1831,6 +2810,14 @@ class EsophaScopeWindow(QMainWindow):
         self._state = WorkbenchOperationalState.READY
         self._close_pending = False
 
+        self._models = ModelManager(self)
+        self._model_entry: ModelEntry | None = None
+        self._load_pool = QThreadPool(self)
+        self._load_pool.setMaxThreadCount(1)  # loads are serialised; newest wins
+        self._load_signals = SlideLoadSignals(self)
+        self._load_tasks: dict[int, SlideLoadTask] = {}
+        self._load_request_id = 0
+
         # White glyphs: both icons sit on the filled primary/critical button.
         self._icon_play = build_svg_icon("play", COLOR_TEXT_LIGHT)
         self._icon_stop = build_svg_icon("stop", COLOR_TEXT_LIGHT)
@@ -1838,6 +2825,14 @@ class EsophaScopeWindow(QMainWindow):
         self._setup_ui()
         self._setup_shortcuts()
         self._sync_control_states()
+
+        self._load_signals.status.connect(self._on_slide_status)
+        self._load_signals.loaded.connect(self._on_slide_loaded)
+        self._load_signals.failed.connect(self._on_slide_load_failed)
+        self._load_signals.finished.connect(self._on_slide_load_finished)
+        self._models.state_changed.connect(self._on_model_state)
+        # Start initialising the model immediately so it is ready before "Run".
+        self._model_entry = self._models.request(self._config.model_weights_path)
 
     def _setup_shortcuts(self) -> None:
         self._shortcut_reset = QShortcut(QKeySequence("Ctrl+W"), self)
@@ -2149,9 +3144,9 @@ class EsophaScopeWindow(QMainWindow):
         ribbon.addWidget(self._pill_hotspot)
         ribbon.addStretch(1)
 
-        device_identity = describe_provider(select_execution_providers()[0])
-        self._pill_hardware = QLabel(device_identity)
+        self._pill_hardware = QLabel("Model: loading…")
         self._pill_hardware.setObjectName("hudHardwarePill")
+        self._pill_hardware.setProperty("modelState", "loading")
         ribbon.addWidget(self._pill_hardware)
 
         vbox.addLayout(ribbon)
@@ -2209,6 +3204,7 @@ class EsophaScopeWindow(QMainWindow):
             )
             return
 
+        self._cancel_pending_loads()
         if self._canvas_item:
             self._scene.removeItem(self._canvas_item)
             self._canvas_item.close()
@@ -2230,8 +3226,7 @@ class EsophaScopeWindow(QMainWindow):
         self._pill_slide.setText("No slide loaded")
         self._pill_detections.setText("Detections: 0")
         self._pill_hotspot.setText("Peak HPF: —")
-        self._progress_bar.setValue(0)
-        self._lbl_progress_detail.setText("0 / 0 patches")
+        self._set_idle_progress()
 
         self._lbl_status_badge.setText("UNANALYZED")
         self._lbl_status_badge.setProperty("clinicalEvaluation", "none")
@@ -2245,6 +3240,9 @@ class EsophaScopeWindow(QMainWindow):
         self._lbl_dist_err.setText("—")
         self._lbl_meta_dims.setText("—")
         self._lbl_meta_mpp.setText("—")
+        self._lbl_meta_mpp.setProperty("calibration", "ok")
+        self._lbl_meta_mpp.setToolTip("")
+        self._refresh_styling(self._lbl_meta_mpp)
         self._lbl_meta_vendor.setText("—")
         self._lbl_meta_tissue.setText("—")
 
@@ -2274,99 +3272,161 @@ class EsophaScopeWindow(QMainWindow):
         if path:
             self._load_gt(path)
 
+    def _is_loading(self) -> bool:
+        return self._state == WorkbenchOperationalState.LOADING
+
+    def _cancel_pending_loads(self) -> None:
+        """Flags every outstanding load and invalidates their results."""
+        self._load_request_id += 1
+        for task in self._load_tasks.values():
+            task.cancel()
+
+    def _set_idle_progress(self) -> None:
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._lbl_progress_detail.setText("0 / 0 patches")
+
     def _load_slide(self, slide_path: str) -> None:
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._log_status("Decoding WSI pyramid and generating tissue mask...")
-        QApplication.processEvents()
+        """Queues a background load; a newer request supersedes any older one."""
+        if self._is_worker_busy():
+            return
+        self._cancel_pending_loads()
+        task = SlideLoadTask(
+            self._load_request_id, slide_path, self._config, self._load_signals
+        )
+        self._load_tasks[self._load_request_id] = task
+        self._progress_bar.setRange(0, 0)  # busy indicator
+        self._lbl_progress_detail.setText("Opening slide…")
+        self._transition_state(
+            WorkbenchOperationalState.LOADING, f"Opening {Path(slide_path).name}..."
+        )
+        self._load_pool.start(task)
 
-        try:
-            if self._canvas_item:
-                self._scene.removeItem(self._canvas_item)
-                self._canvas_item.close()
-                self._canvas_item = None
+    @Slot(int, str)
+    def _on_slide_status(self, request_id: int, message: str) -> None:
+        if request_id == self._load_request_id:
+            self._log_status(message)
 
-            slide = openslide.OpenSlide(slide_path)
-            w, h = slide.dimensions
-            mpp_x = float(
-                slide.properties.get(openslide.PROPERTY_NAME_MPP_X, TARGET_MODEL_MPP)
-            )
-            mpp_y = float(
-                slide.properties.get(openslide.PROPERTY_NAME_MPP_Y, TARGET_MODEL_MPP)
-            )
-            vendor = str(
-                slide.properties.get(openslide.PROPERTY_NAME_VENDOR, "Generic Scanner")
-            )
-            mag = str(slide.properties.get("openslide.objective-power", "40"))
+    @Slot(int, object)
+    def _on_slide_loaded(self, request_id: int, result: SlideLoadResult) -> None:
+        """GUI-thread half of loading: builds pixmaps/items and swaps the slide."""
+        if request_id != self._load_request_id:
+            return  # stale result from a superseded request
+        spec = result.spec
+        thumb_h, thumb_w = result.thumbnail_rgb.shape[:2]
 
-            scale = min(
-                self._config.thumbnail_max_dimension / float(w),
-                self._config.thumbnail_max_dimension / float(h),
-                1.0,
+        overview = QPixmap.fromImage(
+            QImage(
+                result.thumbnail_rgb.data,
+                thumb_w,
+                thumb_h,
+                3 * thumb_w,
+                QImage.Format.Format_RGB888,
             )
-            tw, th = max(1, round(w * scale)), max(1, round(h * scale))
-            thumb_pil = slide.get_thumbnail((tw, th)).convert("RGB")
-            thumb_np = np.asarray(thumb_pil)
-
-            self._tissue_mask = generate_tissue_mask_hsv(
-                thumb_np, self._config.tissue_sat_threshold
+        )
+        tissue_pixmap = QPixmap.fromImage(
+            QImage(
+                result.tissue_overlay_rgba.data,
+                thumb_w,
+                thumb_h,
+                4 * thumb_w,
+                QImage.Format.Format_RGBA8888,
             )
-            tissue_pixels = int(np.count_nonzero(self._tissue_mask))
-            tissue_area_mm2 = (
-                tissue_pixels * ((w / tw) * mpp_x) * ((h / th) * mpp_y)
-            ) / 1_000_000.0
+        )
 
-            self._slide_spec = SlideSpecification(
-                slide_path=slide_path,
-                file_name=Path(slide_path).name,
-                width_px=w,
-                height_px=h,
-                mpp_x=mpp_x,
-                mpp_y=mpp_y,
-                scanner_model=vendor,
-                magnification=mag,
-                level_count=slide.level_count,
-                level_dimensions=list(slide.level_dimensions),
-                level_downsamples=list(slide.level_downsamples),
-                tissue_surface_area_mm2=tissue_area_mm2,
+        previous = self._canvas_item
+        if previous is not None:
+            self._scene.removeItem(previous)
+            previous.close()
+        self._canvas_item = PyramidalSlideCanvas(spec, overview)
+        self._scene.addItem(self._canvas_item)
+        self._scene.setSceneRect(QRectF(0, 0, spec.width_px, spec.height_px))
+        self._viewport.fitInView(
+            self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
+        )
+
+        self._tissue_overlay_item.setPixmap(tissue_pixmap)
+        # Independent X/Y scale: the thumbnail's aspect may differ by a pixel.
+        self._tissue_overlay_item.setTransform(
+            QTransform.fromScale(spec.width_px / thumb_w, spec.height_px / thumb_h)
+        )
+        self._tissue_overlay_item.setVisible(self._chk_tissue.isChecked())
+
+        # Detections/hotspot belong to the previous slide; ground truth is kept.
+        self._all_cells = []
+        self._visible_cells = []
+        self._hotspot = None
+        self._cell_overlay.clear()
+        self._hotspot_overlay.set_diagnostic_summary(None)
+        self._btn_fab_hotspot.setEnabled(False)
+        self._pill_detections.setText("Detections: 0")
+        self._pill_hotspot.setText("Peak HPF: —")
+
+        self._slide_spec = spec
+        self._tissue_mask = result.tissue_mask
+
+        self._pill_slide.setText(spec.file_name)
+        self._lbl_meta_dims.setText(f"{spec.width_px:,} × {spec.height_px:,} px")
+        mpp_text = f"{spec.mpp_x:.4f} × {spec.mpp_y:.4f} µm/px"
+        if spec.mpp_is_fallback:
+            mpp_text += " (ASSUMED)"
+        self._lbl_meta_mpp.setText(mpp_text)
+        self._lbl_meta_mpp.setProperty(
+            "calibration", "fallback" if spec.mpp_is_fallback else "ok"
+        )
+        self._lbl_meta_mpp.setToolTip("\n".join(spec.calibration_notes))
+        self._refresh_styling(self._lbl_meta_mpp)
+        self._lbl_meta_vendor.setText(f"{spec.scanner_model} ({spec.magnification}x)")
+        self._lbl_meta_tissue.setText(f"{spec.tissue_surface_area_mm2:.2f} mm²")
+
+        self._set_idle_progress()
+        self._update_metrics_view()
+        self._transition_state(
+            WorkbenchOperationalState.READY, "Slide ready for analysis."
+        )
+
+        for note in spec.calibration_notes:
+            logger.warning("Calibration: %s", note)
+        if spec.mpp_is_fallback:
+            self._log_status("WARNING: slide calibration missing; MPP is assumed.")
+            QMessageBox.warning(
+                self,
+                "Slide calibration",
+                "\n\n".join(spec.calibration_notes),
             )
-            slide.close()
 
-            thumb_qimg = QImage(
-                thumb_np.tobytes(), tw, th, 3 * tw, QImage.Format.Format_RGB888
-            )
-            overview_pixmap = QPixmap.fromImage(thumb_qimg)
+    @Slot(int, str)
+    def _on_slide_load_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._load_request_id:
+            return
+        self._set_idle_progress()
+        self._transition_state(
+            WorkbenchOperationalState.READY, "Slide could not be opened."
+        )
+        QMessageBox.critical(self, "OpenSlide Loading Error", message)
 
-            self._canvas_item = PyramidalSlideCanvas(slide_path, overview_pixmap)
-            self._scene.addItem(self._canvas_item)
-            self._scene.setSceneRect(QRectF(0, 0, w, h))
-            self._viewport.fitInView(
-                self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
-            )
+    @Slot(int)
+    def _on_slide_load_finished(self, request_id: int) -> None:
+        self._load_tasks.pop(request_id, None)
+        if request_id == self._load_request_id and self._is_loading():
+            # Finished without a result (e.g. cancelled): leave LOADING.
+            self._set_idle_progress()
+            self._transition_state(WorkbenchOperationalState.READY)
+        if self._close_pending and not self._load_tasks and not self._is_worker_busy():
+            self.close()
 
-            tissue_rgba = build_tissue_overlay_image(self._tissue_mask)
-            t_qimg = QImage(
-                tissue_rgba.tobytes(), tw, th, 4 * tw, QImage.Format.Format_RGBA8888
-            )
-            self._tissue_overlay_item.setPixmap(QPixmap.fromImage(t_qimg))
-            self._tissue_overlay_item.resetTransform()
-            self._tissue_overlay_item.setScale(w / float(tw))
-            self._tissue_overlay_item.setVisible(self._chk_tissue.isChecked())
-
-            self._pill_slide.setText(self._slide_spec.file_name)
-            self._lbl_meta_dims.setText(f"{w:,} × {h:,} px")
-            self._lbl_meta_mpp.setText(f"{mpp_x:.4f} × {mpp_y:.4f} µm/px")
-            self._lbl_meta_vendor.setText(f"{vendor} ({mag}x)")
-            self._lbl_meta_tissue.setText(f"{tissue_area_mm2:.2f} mm²")
-
-            self._transition_state(
-                WorkbenchOperationalState.READY, "Slide ready for analysis."
-            )
-        except (openslide.OpenSlideError, OSError, ValueError, RuntimeError) as exc:
-            logger.exception("Failed to load slide")
-            QMessageBox.critical(self, "OpenSlide Loading Error", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
-            self._sync_control_states()
+    @Slot(str, str, str)
+    def _on_model_state(self, state: str, label: str, detail: str) -> None:
+        self._pill_hardware.setText(label)
+        self._pill_hardware.setProperty("modelState", state)
+        self._pill_hardware.setToolTip(detail)
+        self._refresh_styling(self._pill_hardware)
+        if state == "ready":
+            self._log_status(f"Model ready: {detail}.")
+        elif state == "warning":
+            self._log_status("Model ready on CPU; GPU unavailable (see tooltip).")
+        elif state == "error":
+            self._log_status(f"Model unavailable: {detail}")
 
     def _load_gt(self, path: str) -> None:
         try:
@@ -2389,7 +3449,12 @@ class EsophaScopeWindow(QMainWindow):
             self._execute_inference()
 
     def _execute_inference(self) -> None:
-        if not self._slide_spec or self._tissue_mask is None or self._is_worker_busy():
+        if (
+            not self._slide_spec
+            or self._tissue_mask is None
+            or self._is_worker_busy()
+            or self._is_loading()
+        ):
             return
 
         self._all_cells.clear()
@@ -2407,6 +3472,8 @@ class EsophaScopeWindow(QMainWindow):
             self._config,
             self._slide_spec,
             self._tissue_mask,
+            # Reuses the already-initialised session unless the model file changed.
+            self._models.request(self._config.model_weights_path),
         )
         self._inference_worker.moveToThread(self._inference_thread)
 
@@ -2422,9 +3489,16 @@ class EsophaScopeWindow(QMainWindow):
             self._inference_worker.deleteLater
         )
         self._inference_thread.finished.connect(self._inference_thread.deleteLater)
+        self._inference_thread.finished.connect(self._on_inference_thread_finished)
 
         self._sync_control_states()
         self._inference_thread.start()
+
+    @Slot()
+    def _on_inference_thread_finished(self) -> None:
+        # The QThread/worker are deleteLater()'d; drop the dangling references.
+        self._inference_thread = None
+        self._inference_worker = None
 
     def _cancel_inference(self) -> None:
         if (
@@ -2683,12 +3757,14 @@ class EsophaScopeWindow(QMainWindow):
 
     def _sync_control_states(self) -> None:
         busy = self._is_worker_busy()
+        loading = self._is_loading()
         has_slide = self._slide_spec is not None
 
+        # Opening stays enabled while loading: a newer request supersedes the old.
         self._btn_open_slide.setEnabled(not busy)
         self._btn_open_gt.setEnabled(not busy)
         self._btn_export_geojson.setEnabled(
-            has_slide and not busy and len(self._visible_cells) > 0
+            has_slide and not busy and not loading and len(self._visible_cells) > 0
         )
 
         if self._state == WorkbenchOperationalState.EXECUTING:
@@ -2703,34 +3779,34 @@ class EsophaScopeWindow(QMainWindow):
             self._btn_run_cancel.setText("Run Tiled Inference")
             self._btn_run_cancel.setProperty("role", "primary")
             self._btn_run_cancel.setIcon(self._icon_play)
-            self._btn_run_cancel.setEnabled(has_slide)
+            self._btn_run_cancel.setEnabled(has_slide and not loading)
 
         self._refresh_styling(self._btn_run_cancel)
 
     def _handle_dropped_files(self, paths: list[str]) -> None:
         if self._is_worker_busy():
             return
+        slides = [p for p in paths if Path(p).suffix.lower() in SLIDE_EXTENSIONS]
+        if slides:
+            self._load_slide(slides[-1])  # only the last dropped slide is shown
         for p in paths:
-            ext = Path(p).suffix.lower()
-            if ext in {".svs", ".ndpi", ".mrxs", ".tif", ".tiff"}:
-                self._load_slide(p)
-            elif ext in {".geojson", ".json"}:
+            if Path(p).suffix.lower() in ANNOTATION_EXTENSIONS:
                 self._load_gt(p)
 
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:
-        if e.mimeData().hasUrls():
+        if dropped_local_paths(e.mimeData()):
             e.acceptProposedAction()
         else:
             e.ignore()
 
     def dragMoveEvent(self, e: QDragMoveEvent) -> None:
-        if e.mimeData().hasUrls():
+        if dropped_local_paths(e.mimeData()):
             e.acceptProposedAction()
         else:
             e.ignore()
 
     def dropEvent(self, e: QDropEvent) -> None:
-        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        paths = dropped_local_paths(e.mimeData())
         if paths:
             self._handle_dropped_files(paths)
             e.acceptProposedAction()
@@ -2738,19 +3814,50 @@ class EsophaScopeWindow(QMainWindow):
             e.ignore()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._is_worker_busy():
+        if self._is_worker_busy() or self._load_tasks:
+            # Defer until background work has stopped and released its handles.
             self._close_pending = True
             self._cancel_inference()
+            self._cancel_pending_loads()
+            self._log_status("Closing once background work has stopped...")
             event.ignore()
             return
+        thread = self._inference_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait(5000)
+        self._models.shutdown()
         if self._canvas_item:
-            self._canvas_item.close()
+            self._canvas_item.close(wait=True)
+            self._canvas_item = None
         event.accept()
 
 
 # ==============================================================================
 # ENTRY POINT
 # ==============================================================================
+def announce_desktop_file_name(app: QApplication) -> None:
+    """Sets the Linux desktop-file ID only when a matching desktop entry exists.
+
+    Qt registers this ID with xdg-desktop-portal; without an installed
+    '<id>.desktop' the portal rejects it ("App info not found"). Claiming an ID
+    that does not exist achieves nothing, so it is only announced when real.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    entry = QStandardPaths.locate(
+        QStandardPaths.StandardLocation.ApplicationsLocation, f"{APP_ID}.desktop"
+    )
+    if entry:
+        app.setDesktopFileName(APP_ID)
+    else:
+        logger.info(
+            "No '%s.desktop' entry installed; not announcing a desktop-file ID "
+            "(window class falls back to the interpreter name on Wayland).",
+            APP_ID,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="EsophaScope: Digital pathology workstation for esophageal biopsy analysis."
@@ -2771,7 +3878,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName("EsophaScope")
-    app.setDesktopFileName(APP_ID)  # links the window to its icon on Linux
+    announce_desktop_file_name(app)
     app.setWindowIcon(load_app_icon())
     app.setStyleSheet(build_workbench_stylesheet())
     workbench = EsophaScopeWindow(EsophaScopeConfig(model_weights_path=args.model_path))
