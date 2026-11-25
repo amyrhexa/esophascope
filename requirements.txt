@@ -1,8 +1,0 @@
-numpy==2.5.3
-onnxruntime-gpu==1.26.0
-opencv-python==5.0.0.93
-openslide-python==1.4.6
-openslide-bin==4.0.1.2
-Pillow==12.3.0
-PySide6==6.11.2
-scipy==1.18.1

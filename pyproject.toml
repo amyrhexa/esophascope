@@ -1,0 +1,34 @@
+[project]
+name = "esophascope"
+version = "0.4.0"
+description = "Quantitative whole-slide image analysis and hotspot localization suite for esophageal biopsy screening."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy==2.5.3",
+    "onnxruntime-gpu==1.26.0; sys_platform == 'win32'",
+    "onnxruntime-gpu[cuda,cudnn]==1.26.0; sys_platform == 'linux'",
+    "opencv-python==5.0.0.93",
+    "openslide-python==1.4.6",
+    "openslide-bin==4.0.1.2",
+    "Pillow==12.3.0",
+    "PySide6==6.11.2",
+    "scipy==1.18.1",
+]
+
+[project.scripts]
+esophascope = "esophascope:main"
+
+[dependency-groups]
+dev = [
+    "nuitka",
+    "ordered-set",
+    "zstandard",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["esophascope"]

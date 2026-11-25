@@ -827,3 +827,70 @@ If both levels $L+2$ and $L+1$ are cached, it paints $L+2$ across the target rec
     QuPath GeoJSON FeatureCollections for downstream clinical review.
 
 ```
+
+---
+
+## Installation and Usage
+
+This project uses [Astral](https://astral.sh) `uv` as its primary Python project,
+dependency, and environment manager.
+
+### Prerequisites
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (installs and
+  manages a compatible Python 3.12 automatically via `.python-version`)
+
+### Install dependencies
+
+```bash
+uv sync
+```
+
+### Run
+
+```bash
+uv run esophascope
+```
+
+Or, equivalently:
+
+```bash
+uv run python esophascope.py
+```
+
+Optional CLI flag:
+
+```bash
+uv run esophascope --model /path/to/best.onnx
+```
+
+### Development
+
+The `dev` dependency group provides the packaging toolchain used for the
+Windows executable build:
+
+```bash
+uv sync --group dev
+```
+
+### Windows Executable
+
+The Windows release executable is built with Nuitka:
+
+```bash
+uv sync --group dev
+uv run python -m nuitka `
+  --onefile `
+  --enable-plugin=pyside6 `
+  --include-package=openslide_bin `
+  --user-package-configuration-file=.github/nuitka-package.config.yml `
+  --include-data-files=best.onnx=best.onnx `
+  --include-data-files=app.ico=app.ico `
+  --windows-icon-from-ico=app.ico `
+  --windows-console-mode=disable `
+  --assume-yes-for-downloads `
+  --output-dir=dist `
+  --output-filename=esophascope.exe `
+  esophascope.py
+```
+
